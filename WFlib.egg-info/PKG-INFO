@@ -1,0 +1,13 @@
+Metadata-Version: 2.1
+Name: WFlib
+Version: 0.1
+Summary: Library for website fingerprinting attacks
+Author: Xinhao Deng
+Requires-Dist: tqdm
+Requires-Dist: numpy
+Requires-Dist: pandas
+Requires-Dist: scikit-learn
+Requires-Dist: einops
+Requires-Dist: timm
+Requires-Dist: pytorch-metric-learning
+Requires-Dist: captum

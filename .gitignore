@@ -2,3 +2,7 @@ datazoo/
 datasets/
 logs/
 checkpoints/
+plots/
+results/
+*.pyc
+__pycache__/

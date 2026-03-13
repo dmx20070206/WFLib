@@ -35,7 +35,7 @@ rm -rf checkpoints/${dataset}/${model}/proteus.pth
 cp checkpoints/${dataset}/${model}/max_f1.pth checkpoints/${dataset}/${model}/proteus.pth
 wait
 
-for file_name in test day14 day30 day90 day150 day270
+for file_name in day150
 do
     python -u exp/test.py \
       --dataset ${dataset} \
@@ -49,7 +49,7 @@ do
       --load_name max_f1 \
       --result_file ${file_name}
 
-    python -u exp/proteus.py \
+    python -u exp/proteus_type2.py \
         --dataset ${dataset} \
         --model ${model} \
         --device cuda:0 \

@@ -153,7 +153,8 @@ def model_train(
         for index, cur_data in enumerate(pbar):
             cur_X, cur_y = cur_data[0].to(device), cur_data[1].to(device)
             optimizer.zero_grad()
-            outs = model(cur_X)
+            raw_outs = model(cur_X)
+            outs = raw_outs[0] if isinstance(raw_outs, (tuple, list)) else raw_outs
 
             if loss_name == "TripletMarginLoss":
                 hard_pairs = miner(outs, cur_y)
@@ -193,7 +194,8 @@ def model_train(
 
                 for index, cur_data in enumerate(val_pbar):
                     cur_X, cur_y = cur_data[0].to(device), cur_data[1].to(device)
-                    outs = model(cur_X)
+                    raw_outs = model(cur_X)
+                    outs = raw_outs[0] if isinstance(raw_outs, (tuple, list)) else raw_outs
                     
                     if loss_name in ["BCEWithLogitsLoss", "MultiLabelSoftMarginLoss"]:
                         cur_pred = torch.sigmoid(outs)
@@ -258,7 +260,8 @@ def model_eval(
             pbar = tqdm(test_iter, desc="Evaluating", leave=False)
             for index, cur_data in enumerate(pbar):
                 cur_X, cur_y = cur_data[0].to(device), cur_data[1].to(device)
-                outs = model(cur_X)
+                raw_outs = model(cur_X)
+                outs = raw_outs[0] if isinstance(raw_outs, (tuple, list)) else raw_outs
                 if num_tabs == 1:
                     cur_pred = torch.argsort(outs, dim=1, descending=True)[:,0]
                 else:

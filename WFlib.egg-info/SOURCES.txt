@@ -10,6 +10,7 @@ WFlib/models/ARES.py
 WFlib/models/AWF.py
 WFlib/models/BAPM.py
 WFlib/models/DF.py
+WFlib/models/DMX.py
 WFlib/models/Holmes.py
 WFlib/models/MultiTabRF.py
 WFlib/models/NetCLR.py
@@ -21,7 +22,10 @@ WFlib/models/VarCNN.py
 WFlib/models/__init__.py
 WFlib/tools/__init__.py
 WFlib/tools/analyzer.py
+WFlib/tools/data_augmentor.py
 WFlib/tools/data_processor.py
+WFlib/tools/drift_analysis.py
+WFlib/tools/drift_simulator.py
 WFlib/tools/dummypkt_distribution.py
 WFlib/tools/dummypkt_std.py
 WFlib/tools/evaluator.py
@@ -34,5 +38,7 @@ WFlib/tools/norm.py
 WFlib/tools/npz_to_trace.py
 WFlib/tools/overhead.py
 WFlib/tools/rmnoise.py
+WFlib/tools/save.py
 WFlib/tools/split_valid.py
 WFlib/tools/trace_to_npz.py
+WFlib/tools/utils.py

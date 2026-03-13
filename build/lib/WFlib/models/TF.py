@@ -50,9 +50,9 @@ class TF(nn.Module):
 
     def forward(self, x):
         # Pass the input through the feature extraction part
-        x = self.feature_extraction(x)
+        feature = self.feature_extraction(x)
         
         # Pass the output through the classifier part
-        x = self.classifier(x)
+        logit = self.classifier(x)
         
-        return x
+        return feature, logit

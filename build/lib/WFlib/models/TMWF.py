@@ -448,4 +448,11 @@ class TMWF(nn.Module):
         o = self.trm(feat, self.query_embed.unsqueeze(0), self.pos_embed.unsqueeze(0))
         logits = self.fc(o)
         
-        return logits.mean(1)
+        return logits.mean(1), o.mean(1)
+
+if __name__ == '__main__':
+    net = TMWF(num_classes=100)
+    x = np.random.rand(4, 1,30720)
+    x = torch.tensor(x, dtype=torch.float32)
+    out, _ = net(x)
+    print(f"in:{x.shape} --> out:{out.shape}, {_.shape}")

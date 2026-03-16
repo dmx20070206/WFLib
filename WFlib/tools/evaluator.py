@@ -4,6 +4,7 @@ import numpy as np
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from sklearn.metrics import roc_auc_score
 
+
 def precision_at_k(y_true, y_pred, k):
     top_k_preds = np.argsort(y_pred, axis=1)[:, -k:]
     precisions = []
@@ -14,12 +15,14 @@ def precision_at_k(y_true, y_pred, k):
 
     return np.mean(precisions)
 
+
 def average_precision_at_k(y_true, y_pred, k):
     res = 0
     for i in range(k):
-        res += precision_at_k(y_true, y_pred, i+1)
+        res += precision_at_k(y_true, y_pred, i + 1)
     res /= k
     return res
+
 
 def measurement(y_true, y_pred, eval_metrics, num_tabs=1):
     """
@@ -43,12 +46,29 @@ def measurement(y_true, y_pred, eval_metrics, num_tabs=1):
             results[eval_metric] = round(recall_score(y_true, y_pred, average="macro"), 4)
         elif eval_metric == "F1-score":
             results[eval_metric] = round(f1_score(y_true, y_pred, average="macro"), 4)
+        elif eval_metric == "Closed-F1":
+            unknown_label = int(np.max(y_true))
+            known_mask = np.asarray(y_true) != unknown_label
+            if np.any(known_mask):
+                results[eval_metric] = round(
+                    f1_score(np.asarray(y_true)[known_mask], np.asarray(y_pred)[known_mask], average="macro"), 4
+                )
+            else:
+                results[eval_metric] = float("nan")
+        elif eval_metric == "Open-AUROC":
+            unknown_label = int(np.max(y_true))
+            y_true_bin = (np.asarray(y_true) == unknown_label).astype(np.int32)
+            y_score = (np.asarray(y_pred) == unknown_label).astype(np.float32)
+            if y_true_bin.min() == y_true_bin.max():
+                results[eval_metric] = float("nan")
+            else:
+                results[eval_metric] = round(roc_auc_score(y_true_bin, y_score), 4)
         elif eval_metric == "P@min":
             results[eval_metric] = round(np.min(precision_score(y_true, y_pred, average=None)), 4)
         elif eval_metric == "r-Precision":
             results[eval_metric] = round(cal_r_precision(y_true, y_pred), 4)
         elif eval_metric == "AUC":
-            results[eval_metric] = round(roc_auc_score(y_true, y_pred, average='macro'), 4)
+            results[eval_metric] = round(roc_auc_score(y_true, y_pred, average="macro"), 4)
         elif eval_metric.startswith("P@"):
             results[eval_metric] = round(precision_at_k(y_true, y_pred, int(eval_metric[-1])), 4)
         elif eval_metric.startswith("AP@"):
@@ -56,6 +76,7 @@ def measurement(y_true, y_pred, eval_metrics, num_tabs=1):
         else:
             raise ValueError(f"Metric {eval_metric} is not matched.")
     return results
+
 
 def cal_r_precision(y_true, y_pred, base_r=20):
     """
@@ -101,6 +122,7 @@ def cal_r_precision(y_true, y_pred, base_r=20):
         res += web2tp[web] / denominator
     res /= open_class
     return res
+
 
 def median_absolute_deviation(data):
     median = np.median(data)

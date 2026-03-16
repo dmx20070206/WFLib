@@ -8,6 +8,7 @@ from timm.models.layers import DropPath, Mlp
 class TopM_MHSA(nn.Module):
     def __init__(self, embed_dim, num_heads, num_mhsa_layers, dim_feedforward, dropout, top_m):
         super().__init__()
+
         self.nets = nn.ModuleList([MHSA_Block(embed_dim, num_heads, dim_feedforward, dropout, top_m) for _ in range(num_mhsa_layers)])
 
     def forward(self, x, pos_embed):
@@ -103,11 +104,11 @@ class ConvBlock1d(nn.Module):
 
 class LocalProfiling(nn.Module):
     """ Local Profiling module in ARES """
-    def __init__(self, in_channels=8):
+    def __init__(self):
         super(LocalProfiling, self).__init__()
         
         self.net = nn.Sequential(
-            ConvBlock1d(in_channels=in_channels, out_channels=32, kernel_size=7),
+            ConvBlock1d(in_channels=1, out_channels=32, kernel_size=7),
             nn.MaxPool1d(kernel_size=8, stride=4),
             nn.Dropout(p=0.1),
             ConvBlock1d(in_channels=32, out_channels=64, kernel_size=7),
@@ -126,9 +127,7 @@ class LocalProfiling(nn.Module):
         return x
 
 class ARES(nn.Module):
-    def __init__(self, 
-                num_classes,
-                ):
+    def __init__(self, num_classes, ):
         super(ARES, self).__init__()
 
         embed_dim = 256
@@ -136,30 +135,36 @@ class ARES(nn.Module):
         dim_feedforward = 256 * 4
         num_mhsa_layers = 4
         dropout = 0.1
-        max_len = 29
-        top_m=20
-        in_channels = 8
-
-        self.profiling = LocalProfiling(in_channels)
+        max_len = 32
+        top_m = 20
+        
+        self.dividing = nn.Sequential(
+            Rearrange('b c (n p) -> (b n) c p', n=4),
+        )
+        self.combination = nn.Sequential(
+            Rearrange('(b n) c p -> b c (n p)', n=4),
+        )
+        self.profiling = LocalProfiling()
         self.pos_embed = nn.Embedding(max_len, embed_dim).weight
 
         self.topm_mhsa = TopM_MHSA(embed_dim, num_heads, num_mhsa_layers, dim_feedforward, dropout, top_m)
         self.mlp = nn.Linear(embed_dim, num_classes)
 
     def forward(self, x):
+        sliding_size = np.random.randint(0, 1 + 2500)
+        x = torch.roll(x, shifts=sliding_size, dims=-1)
+        x = self.dividing(x)
         x = self.profiling(x)
+        x = self.combination(x)
         x = x.permute(0, 2, 1)
         x = self.topm_mhsa(x, self.pos_embed.unsqueeze(0))
-        x = x.mean(dim=1)
-        x = self.mlp(x)
-        return x
+        feat = x.mean(dim=1)
+        x = self.mlp(feat)
+        return x, feat
 
 if __name__ == '__main__':
-    feat_len = 8000
-    in_channels = 8
     net = ARES(num_classes=100)
-    # print(net)
-    x = np.random.rand(32, in_channels, feat_len)
+    x = np.random.rand(4, 1,10000)
     x = torch.tensor(x, dtype=torch.float32)
-    out = net(x)
-    print(f"in:{x.shape} --> out:{out.shape}")
+    out, _ = net(x)
+    print(f"in:{x.shape} --> out:{out.shape}, {_.shape}")

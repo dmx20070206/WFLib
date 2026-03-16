@@ -34,7 +34,7 @@ do
         --load_name max_f1 \
         --result_file ${file_name}
 
-    python -u exp/proteus_self.py \
+    python -u exp/proteus.py \
         --dataset ${dataset} \
         --model ${model} \
         --device cuda:1 \

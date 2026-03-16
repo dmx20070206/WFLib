@@ -1,19 +1,25 @@
-dataset=OpenWorld
+dataset=OpenSet
 model=DF
 
 python -u exp/train.py \
-  --dataset ${dataset} \
-  --model ${model} \
-  --device cuda:1 \
-  --feature DIR \
-  --seq_len 5000 \
-  --train_epochs 30 \
-  --batch_size 128 \
-  --learning_rate 2e-3 \
-  --optimizer Adamax \
-  --eval_metrics Accuracy Precision Recall F1-score \
-  --save_metric F1-score \
-  --save_name max_f1
+    --open_set \
+    --use_energy_loss \
+    --unknown_label 102 \
+    --dataset ${dataset} \
+    --model ${model} \
+    --device cuda:1 \
+    --feature DIR \
+    --seq_len 5000 \
+    --train_epochs 30 \
+    --batch_size 128 \
+    --learning_rate 2e-3 \
+    --optimizer Adamax \
+    --eval_metrics Accuracy Precision Recall F1-score \
+    --save_metric F1-score \
+    --save_name max_f1 \
+    --energy_m_in -18 \
+    --energy_m_out -2 \
+    --energy_weight 0.1
 
 wait
 rm -rf checkpoints/${dataset}/${model}/proteus.pth
@@ -23,6 +29,8 @@ wait
 for file_name in day270
 do
     python -u exp/test.py \
+        --open_set \
+        --unknown_label 102 \
         --dataset ${dataset} \
         --model ${model} \
         --device cuda:1 \
@@ -34,10 +42,11 @@ do
         --load_name max_f1 \
         --result_file ${file_name}
 
-    python -u exp/proteus.py \
+    python -u exp/proteus_os.py \
+        --unknown_label 102 \
         --dataset ${dataset} \
         --model ${model} \
-        --device cuda:1 \
+        --device cuda:3 \
         --train_file train \
         --test_file ${file_name} \
         --feature DIR \

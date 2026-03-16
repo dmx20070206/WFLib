@@ -44,9 +44,9 @@ class RF(nn.Module):
         x = self.first_layer(x)
         x = x.view(x.size(0), self.first_layer_out_channel, -1)
         x = self.features(x)
-        x = self.classifier(x)
-        x = x.view(x.size(0), -1)
-        return x
+        out = self.classifier(x)
+        out = out.view(out.size(0), -1)
+        return out, x.view(x.size(0), -1)
 
     def _initialize_weights(self):
         """
@@ -117,3 +117,10 @@ def make_first_layers(in_channels=1, out_channel=32):
     layers += [nn.MaxPool2d((2, 2)), nn.Dropout(0.1)]
 
     return nn.Sequential(*layers)
+
+if __name__ == '__main__':
+    net = RF(num_classes=100)
+    x = np.random.rand(4, 1, 2, 1800)
+    x = torch.tensor(x, dtype=torch.float32)
+    out, feat = net(x)
+    print(f"in:{x.shape} --> out:{out.shape}, {feat.shape}")

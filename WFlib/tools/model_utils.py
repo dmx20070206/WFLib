@@ -6,11 +6,12 @@ import torch.nn.functional as F
 from pytorch_metric_learning import miners, losses
 from sklearn.metrics.pairwise import cosine_similarity
 from .evaluator import measurement
-from tqdm import tqdm  
+from tqdm import tqdm
 import warnings
 
 warnings.filterwarnings("ignore")
 os.environ["PYTHONWARNINGS"] = "ignore"
+
 
 def knn_monitor(net, device, memory_data_loader, test_data_loader, num_classes, k=200, t=0.1):
     """
@@ -33,7 +34,7 @@ def knn_monitor(net, device, memory_data_loader, test_data_loader, num_classes, 
     feature_bank, feature_labels = [], []
     y_pred = []
     y_true = []
-    
+
     with torch.no_grad():
         # Generate feature bank
         # Use tqdm
@@ -56,11 +57,12 @@ def knn_monitor(net, device, memory_data_loader, test_data_loader, num_classes, 
             total_num += data.size(0)
             y_pred.append(pred_labels[:, 0].cpu().numpy())
             y_true.append(target.cpu().numpy())
-    
+
     y_true = np.concatenate(y_true).flatten()
     y_pred = np.concatenate(y_pred).flatten()
-    
+
     return y_true, y_pred
+
 
 def knn_predict(feature, feature_bank, feature_labels, classes, knn_k, knn_t):
     """
@@ -86,8 +88,9 @@ def knn_predict(feature, feature_bank, feature_labels, classes, knn_k, knn_t):
     one_hot_label = one_hot_label.scatter(dim=-1, index=sim_labels.view(-1, 1), value=1.0)
     pred_scores = torch.sum(one_hot_label.view(feature.size(0), -1, classes) * sim_weight.unsqueeze(dim=-1), dim=1)
     pred_labels = pred_scores.argsort(dim=-1, descending=True)
-    
+
     return pred_labels
+
 
 def fast_count_burst(arr):
     """
@@ -106,8 +109,21 @@ def fast_count_burst(arr):
     segment_lengths = segment_ends - segment_starts + 1
     segment_signs = np.sign(arr[segment_starts])
     adjusted_lengths = segment_lengths * segment_signs
-    
+
     return adjusted_lengths
+
+
+def _filter_unknown_labels(y_true, y_pred, num_tabs, ignore_unknown_label=False, unknown_label=102):
+    if not ignore_unknown_label or num_tabs != 1:
+        return y_true, y_pred
+
+    mask = y_true != unknown_label
+    if mask.ndim > 1:
+        mask = mask.squeeze()
+    if not np.any(mask):
+        raise ValueError("No known-class samples left after filtering unknown labels.")
+    return y_true[mask], y_pred[mask]
+
 
 def model_train(
     model,
@@ -122,7 +138,13 @@ def model_train(
     num_classes,
     num_tabs,
     device,
-    lradj
+    lradj,
+    open_set=False,
+    unknown_label=102,
+    use_energy_loss=False,
+    energy_weight=0.1,
+    energy_m_in=-12.0,
+    energy_m_out=-6.0,
 ):
     if loss_name in ["CrossEntropyLoss", "BCEWithLogitsLoss", "MultiLabelSoftMarginLoss"]:
         criterion = eval(f"torch.nn.{loss_name}")()
@@ -136,9 +158,12 @@ def model_train(
     else:
         raise ValueError(f"Loss function {loss_name} is not matched.")
 
+    if use_energy_loss and (not open_set or loss_name != "CrossEntropyLoss" or num_tabs != 1):
+        raise ValueError("Energy loss currently supports only Open-set + CrossEntropyLoss + num_tabs=1.")
+
     if lradj != "None":
         scheduler = eval(f"torch.optim.lr_scheduler.{lradj}")(optimizer, step_size=30, gamma=0.74)
-    
+
     assert save_metric in eval_metrics, f"save_metric {save_metric} should be included in {eval_metrics}"
     metric_best_value = 0
     best_epoch = 0
@@ -147,39 +172,67 @@ def model_train(
         model.train()
         sum_loss = 0
         sum_count = 0
-        
-        pbar = tqdm(train_iter, desc=f"Epoch {epoch+1:03d}/{train_epochs} [Train]", leave=False)
-        
-        for index, cur_data in enumerate(pbar):
+
+        pbar = tqdm(train_iter, desc=f"Epoch {epoch + 1:03d}/{train_epochs} [Train]", leave=False)
+
+        for _, cur_data in enumerate(pbar):
             cur_X, cur_y = cur_data[0].to(device), cur_data[1].to(device)
             optimizer.zero_grad()
             raw_outs = model(cur_X)
             outs = raw_outs[0] if isinstance(raw_outs, (tuple, list)) else raw_outs
 
+            loss_terms = []
+            in_mask = None
+            out_mask = None
+
+            if open_set and num_tabs == 1:
+                in_mask = cur_y != unknown_label
+                out_mask = ~in_mask
+
             if loss_name == "TripletMarginLoss":
                 hard_pairs = miner(outs, cur_y)
-                loss = criterion(outs, cur_y, hard_pairs)
+                loss_terms.append(criterion(outs, cur_y, hard_pairs))
             elif loss_name == "SupConLoss":
-                loss = criterion(outs, cur_y)
+                loss_terms.append(criterion(outs, cur_y))
             elif loss_name == "MultiCrossEntropyLoss":
-                loss = 0
+                loss_ct_sum = 0
                 cur_indices = torch.nonzero(cur_y)
-                cur_indices = cur_indices[:,1].view(-1, num_tabs)
+                cur_indices = cur_indices[:, 1].view(-1, num_tabs)
                 for ct in range(num_tabs):
                     loss_ct = criterion(outs[:, ct], cur_indices[:, ct])
-                    loss = loss + loss_ct
+                    loss_ct_sum = loss_ct_sum + loss_ct
+                loss_terms.append(loss_ct_sum)
+            elif loss_name == "CrossEntropyLoss" and open_set and num_tabs == 1:
+                if in_mask.any():
+                    loss_terms.append(criterion(outs[in_mask], cur_y[in_mask]))
             else:
-                loss = criterion(outs, cur_y)
-            
+                loss_terms.append(criterion(outs, cur_y))
+
+            if use_energy_loss:
+                energy = -torch.logsumexp(outs, dim=1)
+                energy_in = torch.tensor(0.0, device=device)
+                energy_out = torch.tensor(0.0, device=device)
+
+                if in_mask.any():
+                    energy_in = torch.relu(energy[in_mask] - energy_m_in).mean()
+                if out_mask.any():
+                    energy_out = torch.relu(energy_m_out - energy[out_mask]).mean()
+
+                energy_loss = energy_in + energy_out
+                loss_terms.append(energy_weight * energy_loss)
+
+            if len(loss_terms) == 0:
+                continue
+
+            loss = sum(loss_terms)
             loss.backward()
             optimizer.step()
-            sum_loss += loss.data.cpu().numpy() * outs.shape[0]
+
+            sum_loss += float(loss.detach().cpu().item()) * outs.shape[0]
             sum_count += outs.shape[0]
-            
-            # Update progress bar
             pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
 
-        train_loss = round(sum_loss / sum_count, 3)
+        train_loss = round(sum_loss / max(sum_count, 1), 3)
 
         if loss_name in ["TripletMarginLoss", "SupConLoss"]:
             valid_true, valid_pred = knn_monitor(model, device, train_iter, valid_iter, num_classes, 10)
@@ -188,82 +241,91 @@ def model_train(
                 model.eval()
                 valid_pred = []
                 valid_true = []
-                
-                # Use tqdm for validation loop
-                val_pbar = tqdm(valid_iter, desc=f"Epoch {epoch+1:03d}/{train_epochs} [Valid]", leave=False)
 
-                for index, cur_data in enumerate(val_pbar):
+                val_pbar = tqdm(valid_iter, desc=f"Epoch {epoch + 1:03d}/{train_epochs} [Valid]", leave=False)
+
+                for _, cur_data in enumerate(val_pbar):
                     cur_X, cur_y = cur_data[0].to(device), cur_data[1].to(device)
                     raw_outs = model(cur_X)
                     outs = raw_outs[0] if isinstance(raw_outs, (tuple, list)) else raw_outs
-                    
+
                     if loss_name in ["BCEWithLogitsLoss", "MultiLabelSoftMarginLoss"]:
                         cur_pred = torch.sigmoid(outs)
                     elif loss_name == "CrossEntropyLoss":
-                        cur_pred = torch.argsort(outs, dim=1, descending=True)[:,0]
+                        cur_pred = torch.argsort(outs, dim=1, descending=True)[:, 0]
                     elif loss_name == "MultiCrossEntropyLoss":
                         cur_indices = torch.argmax(outs, dim=-1).cpu()
                         cur_pred = torch.zeros((cur_indices.shape[0], num_classes))
                         for cur_tab in range(cur_indices.shape[1]):
                             row_indices = torch.arange(cur_pred.shape[0])
-                            cur_pred[row_indices,cur_indices[:,cur_tab]] += 1
+                            cur_pred[row_indices, cur_indices[:, cur_tab]] += 1
                     else:
                         raise ValueError(f"Loss function {loss_name} is not matched.")
 
                     valid_pred.append(cur_pred.cpu().numpy())
                     valid_true.append(cur_y.cpu().numpy())
-                
+
                 valid_pred = np.concatenate(valid_pred)
                 valid_true = np.concatenate(valid_true)
-        
+
+        valid_true, valid_pred = _filter_unknown_labels(
+            valid_true,
+            valid_pred,
+            num_tabs,
+            ignore_unknown_label=open_set,
+            unknown_label=unknown_label,
+        )
+
         valid_result = measurement(valid_true, valid_pred, eval_metrics, num_tabs)
-        
-        # Format output
+
         res_str = ", ".join([f"{k}: {v:.4f}" for k, v in valid_result.items()])
-        print(f"Epoch {epoch+1:03d} | Loss: {train_loss:.4f} | {res_str}")
-        
+        print(f"Epoch {epoch + 1:03d} | Loss: {train_loss:.4f} | {res_str}")
+
         if valid_result[save_metric] > metric_best_value:
             metric_best_value = valid_result[save_metric]
             best_epoch = epoch
             torch.save(model.state_dict(), out_file)
             print(f"  >>> Best {save_metric} updated: {metric_best_value:.4f}, model saved.")
-            
+
         if lradj != "None":
             scheduler.step()
 
-    print(f"\n{'='*20} Training Finished {'='*20}")
-    print(f"Best Epoch: {best_epoch+1}")
+    print(f"\n{'=' * 20} Training Finished {'=' * 20}")
+    print(f"Best Epoch: {best_epoch + 1}")
     print(f"Best {save_metric}: {metric_best_value:.4f}")
 
+
 def model_eval(
-        model, 
-        test_iter, 
-        valid_iter, 
-        eval_method, 
-        eval_metrics, 
-        out_file, 
-        num_classes, 
-        ckp_path, 
-        scenario,
-        num_tabs,
-        device
-    ):
-    print(f"{'='*20} Start Evaluation ({eval_method}) {'='*20}")
-    
+    model,
+    test_iter,
+    valid_iter,
+    eval_method,
+    eval_metrics,
+    out_file,
+    num_classes,
+    ckp_path,
+    scenario,
+    num_tabs,
+    device,
+    ignore_unknown_label=False,
+    unknown_label=102,
+):
+    print(f"{'=' * 20} Start Evaluation ({eval_method}) {'=' * 20}")
+
     if eval_method == "common":
         with torch.no_grad():
             model.eval()
             y_pred = []
             y_true = []
 
-            # Use tqdm
             pbar = tqdm(test_iter, desc="Evaluating", leave=False)
-            for index, cur_data in enumerate(pbar):
+            for _, cur_data in enumerate(pbar):
                 cur_X, cur_y = cur_data[0].to(device), cur_data[1].to(device)
                 raw_outs = model(cur_X)
                 outs = raw_outs[0] if isinstance(raw_outs, (tuple, list)) else raw_outs
+
                 if num_tabs == 1:
-                    cur_pred = torch.argsort(outs, dim=1, descending=True)[:,0]
+                    cur_pred = torch.argsort(outs, dim=1, descending=True)[:, 0]
                 else:
                     if len(outs.shape) <= 2:
                         cur_pred = torch.sigmoid(outs)
@@ -272,7 +334,7 @@ def model_eval(
                         cur_pred = torch.zeros((cur_indices.shape[0], num_classes))
                         for cur_tab in range(cur_indices.shape[1]):
                             row_indices = torch.arange(cur_pred.shape[0])
-                            cur_pred[row_indices,cur_indices[:,cur_tab]] += 1
+                            cur_pred[row_indices, cur_indices[:, cur_tab]] += 1
 
                 y_pred.append(cur_pred.cpu().numpy())
                 y_true.append(cur_y.cpu().numpy())
@@ -284,7 +346,9 @@ def model_eval(
     elif eval_method == "Holmes":
         open_threshold = 1e-2
         spatial_dist_file = os.path.join(ckp_path, "spatial_distribution.npz")
-        assert os.path.exists(spatial_dist_file), f"{spatial_dist_file} does not exist, please run spatial_analysis.py first"
+        assert os.path.exists(
+            spatial_dist_file
+        ), f"{spatial_dist_file} does not exist, please run spatial_analysis.py first"
         spatial_data = np.load(spatial_dist_file)
         webs_centroid = spatial_data["centroid"]
         webs_radius = spatial_data["radius"]
@@ -294,9 +358,8 @@ def model_eval(
             y_pred = []
             y_true = []
 
-            # Use tqdm
             pbar = tqdm(test_iter, desc="Evaluating (Holmes)", leave=False)
-            for index, cur_data in enumerate(pbar):
+            for _, cur_data in enumerate(pbar):
                 cur_X, cur_y = cur_data[0].to(device), cur_data[1].to(device)
                 embs = model(cur_X).cpu().numpy()
                 cur_y = cur_y.cpu().numpy()
@@ -308,7 +371,7 @@ def model_eval(
                 if scenario == "Open-world":
                     outs_d = np.min(all_sims, axis=1)
                     open_indices = np.where(outs_d > open_threshold)[0]
-                    outs[open_indices] = num_classes - 1
+                    outs[open_indices] = unknown_label
 
                 y_pred.append(outs)
                 y_true.append(cur_y)
@@ -316,16 +379,24 @@ def model_eval(
             y_true = np.concatenate(y_true).flatten()
     else:
         raise ValueError(f"Evaluation method {eval_method} is not matched.")
-    
+
+    y_true, y_pred = _filter_unknown_labels(
+        y_true,
+        y_pred,
+        num_tabs,
+        ignore_unknown_label=ignore_unknown_label,
+        unknown_label=unknown_label,
+    )
+
     result = measurement(y_true, y_pred, eval_metrics, num_tabs)
-    
-    # Format output
+
     res_str = ", ".join([f"{k}: {v:.4f}" for k, v in result.items()])
     print(f"Result: {res_str}")
-    print(f"{'='*20} Evaluation Finished {'='*20}\n")
+    print(f"{'=' * 20} Evaluation Finished {'=' * 20}\n")
 
     with open(out_file, "w") as fp:
         json.dump(result, fp, indent=4)
+
 
 def info_nce_loss(features, batch_size, device):
     """
@@ -354,6 +425,7 @@ def info_nce_loss(features, batch_size, device):
 
     return logits, labels
 
+
 def pretrian_accuracy(output, target):
     """
     Compute the accuracy over the top predictions.
@@ -374,6 +446,7 @@ def pretrian_accuracy(output, target):
         res = correct_k.mul_(100.0 / batch_size)
 
         return res.cpu().numpy()[0]
+
 
 def model_pretrian(model, optimizer, train_iter, train_epochs, out_file, batch_size, device):
     """

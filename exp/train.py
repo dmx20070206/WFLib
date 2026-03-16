@@ -18,13 +18,17 @@ parser = argparse.ArgumentParser(description="WFlib")
 parser.add_argument("--dataset", type=str, required=True, default="CW", help="Dataset name")
 parser.add_argument("--model", type=str, required=True, default="DF", help="Model name")
 parser.add_argument("--device", type=str, default="cpu", help="Device, options=[cpu, cuda, cuda:x]")
-parser.add_argument("--num_tabs", type=int, default=1, 
+parser.add_argument("--num_tabs", type=int, default=1,
                     help="Maximum number of tabs opened by users while browsing")
+parser.add_argument("--open_set", action="store_true",
+                    help="Enable Open-set training with unknown-label handling")
+parser.add_argument("--unknown_label", type=int, default=102,
+                    help="Label id used for unknown class samples in Open-set")
 
 # Input parameters
 parser.add_argument("--train_file", type=str, default="train", help="Train file")
 parser.add_argument("--valid_file", type=str, default="valid", help="Valid file")
-parser.add_argument("--feature", type=str, default="DIR", 
+parser.add_argument("--feature", type=str, default="DIR",
                     help="Feature type, options=[DIR, DT, DT2, TAM, TAF]")
 parser.add_argument("--seq_len", type=int, default=5000, help="Input sequence length")
 
@@ -35,13 +39,21 @@ parser.add_argument("--batch_size", type=int, default=256, help="Batch size of t
 parser.add_argument("--learning_rate", type=float, default=2e-3, help="Optimizer learning rate")
 parser.add_argument("--optimizer", type=str, default="Adam", help="Optimizer")
 parser.add_argument("--loss", type=str, default="CrossEntropyLoss", help="Loss function")
-parser.add_argument("--lradj", type=str, default="None", 
+parser.add_argument("--lradj", type=str, default="None",
                     help="adjust learning rate, option=[None, StepLR]")
+parser.add_argument("--use_energy_loss", action="store_true",
+                    help="Enable energy-based regularization in Open-set training")
+parser.add_argument("--energy_weight", type=float, default=0.1,
+                    help="Weight of energy loss term")
+parser.add_argument("--energy_m_in", type=float, default=-12.0,
+                    help="Known-class energy margin m_in")
+parser.add_argument("--energy_m_out", type=float, default=-6.0,
+                    help="Unknown-class energy margin m_out")
 
 # Output parameters
-parser.add_argument('--eval_metrics', nargs='+', required=True, type=str, 
+parser.add_argument('--eval_metrics', nargs='+', required=True, type=str,
                     help="Evaluation metrics, options=[Accuracy, Precision, Recall, F1-score, P@min, r-Precision]")
-parser.add_argument("--save_metric", type=str, default="F1-score", 
+parser.add_argument("--save_metric", type=str, default="F1-score",
                     help="Save the model when the metric reaches its maximum value on the validation set")
 parser.add_argument("--checkpoints", type=str, default="./checkpoints/", help="Location of model checkpoints")
 parser.add_argument("--load_file", type=str, default=None, help="The pre-trained model file")
@@ -49,6 +61,9 @@ parser.add_argument("--save_name", type=str, default="base", help="Name used to 
 
 # Parse arguments
 args = parser.parse_args()
+
+if args.open_set and args.num_tabs != 1:
+    raise ValueError("Open-set mode currently supports only num_tabs=1.")
 
 # Ensure the specified device is available
 if args.device.startswith("cuda"):
@@ -73,8 +88,17 @@ train_X, train_y = data_processor.load_data(os.path.join(in_path, f"{args.train_
 valid_X, valid_y = data_processor.load_data(os.path.join(in_path, f"{args.valid_file}.npz"), args.feature, args.seq_len, args.num_tabs)
 
 if args.num_tabs == 1:
-    num_classes = len(np.unique(train_y))
-    assert num_classes == train_y.max() + 1, "Labels are not continuous" # Ensure labels are continuous
+    if args.open_set:
+        known_train_mask = train_y != args.unknown_label
+        known_train_y = train_y[known_train_mask]
+        if known_train_y.numel() == 0:
+            raise ValueError("No known-class samples found in training set for Open-set mode.")
+        num_classes = int(known_train_y.max().item()) + 1
+        assert num_classes == len(torch.unique(known_train_y)), "Known labels are not continuous"
+        print(f"Open-set enabled: known={known_train_mask.sum().item()}, unknown={(~known_train_mask).sum().item()}")
+    else:
+        num_classes = len(np.unique(train_y))
+        assert num_classes == train_y.max() + 1, "Labels are not continuous"
 else:
     num_classes = train_y.shape[1]
 
@@ -88,7 +112,7 @@ train_iter = data_processor.load_iter(train_X, train_y, args.batch_size, True, a
 valid_iter = data_processor.load_iter(valid_X, valid_y, args.batch_size, False, args.num_workers)
 
 # Initialize model, optimizer, and loss function
-if args.model in ["BAPM", "TMWF"]: # Assume num_tabs is known
+if args.model in ["BAPM", "TMWF"]:
     model = eval(f"models.{args.model}")(num_classes, args.num_tabs)
 else:
     model = eval(f"models.{args.model}")(num_classes)
@@ -113,17 +137,23 @@ model.to(device)
 
 # Train the model
 model_utils.model_train(
-    model, 
-    optimizer, 
-    train_iter, 
-    valid_iter, 
-    args.loss, 
-    args.save_metric, 
-    args.eval_metrics, 
+    model,
+    optimizer,
+    train_iter,
+    valid_iter,
+    args.loss,
+    args.save_metric,
+    args.eval_metrics,
     args.train_epochs,
     out_file,
     num_classes,
     args.num_tabs,
     device,
-    args.lradj
+    args.lradj,
+    args.open_set,
+    args.unknown_label,
+    args.use_energy_loss,
+    args.energy_weight,
+    args.energy_m_in,
+    args.energy_m_out,
 )

@@ -52,15 +52,16 @@ class DF(nn.Module):
             nn.Linear(512, 512, bias=False),  # Fully connected layer
             nn.BatchNorm1d(512),  # Batch normalization layer
             nn.ReLU(inplace=True),  # ReLU activation function
-            nn.Dropout(p=0.5),  # Dropout layer for regularization
-            nn.Linear(512, num_classes)  # Output layer
+            nn.Dropout(p=0.5)  # Dropout layer for regularization
         )
+
+        self.mlp = nn.Linear(512, num_classes)
 
     def forward(self, x):
         # Pass the input through the feature extraction part
         x = self.feature_extraction(x)
         
         # Pass the output through the classifier part
-        x = self.classifier(x)
-        
-        return x
+        feat = self.classifier(x)
+        out = self.mlp(feat)
+        return out, feat

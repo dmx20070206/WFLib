@@ -1,7 +1,7 @@
 dataset=OpenWorld
 model=RF
 
-for filename in train valid test day14 day30 day90 day150 day270
+for filename in train valid day14 day30 day90 day150 day270
 do 
     python -u exp/dataset_process/gen_tam.py \
       --dataset ${dataset} \
@@ -12,7 +12,7 @@ done
 python -u exp/train.py \
   --dataset ${dataset} \
   --model ${model} \
-  --device cuda:7 \
+  --device cuda:0 \
   --train_file tam_train \
   --valid_file tam_valid \
   --feature TAM \
@@ -30,32 +30,34 @@ rm -rf checkpoints/${dataset}/${model}/proteus.pth
 cp checkpoints/${dataset}/${model}/max_f1.pth checkpoints/${dataset}/${model}/proteus.pth
 wait
 
-for file_name in test day14 day30 day90 day150 day270
+for file_name in day14 day30 day90 day150 day270
 do
     python -u exp/test.py \
     --dataset ${dataset} \
     --model ${model} \
-    --device cuda:7 \
+    --device cuda:0 \
     --test_file tam_${file_name} \
     --feature TAM \
     --seq_len 1800 \
     --batch_size 256 \
-    --eval_metrics Accuracy Precision Recall F1-score \
+    --eval_metrics F1-score Closed-F1 Open-AUROC \
     --load_name max_f1 \
     --result_file ${file_name}
 
-    python -u exp/proteus.py \
+    python -u exp/proteus_test.py \
       --dataset ${dataset} \
       --model ${model} \
-      --device cuda:7 \
+      --device cuda:0 \
       --train_file tam_train \
       --test_file tam_${file_name} \
       --feature TAM \
       --seq_len 1800 \
       --batch_size 128 \
-      --eval_metrics Accuracy Precision Recall F1-score \
+      --eval_metrics F1-score Closed-F1 Open-AUROC \
       --load_name proteus \
       --model_save_name proteus \
       --result_file Proteus_${file_name} 
 
+    rm -rf checkpoints/${dataset}/${model}/proteus.pth
+    cp checkpoints/${dataset}/${model}/max_f1.pth checkpoints/${dataset}/${model}/proteus.pth
 done

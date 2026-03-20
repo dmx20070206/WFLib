@@ -20,7 +20,7 @@ rm -rf checkpoints/${dataset}/${model}/proteus.pth
 cp checkpoints/${dataset}/${model}/max_f1.pth checkpoints/${dataset}/${model}/proteus.pth
 wait
 
-for file_name in day270
+for file_name in day14 day30 day90 day150 day270
 do
     python -u exp/test.py \
         --dataset ${dataset} \
@@ -30,7 +30,7 @@ do
         --feature DIR \
         --seq_len 5000 \
         --batch_size 256 \
-        --eval_metrics Accuracy Precision Recall F1-score \
+        --eval_metrics F1-score Closed-F1 Open-AUROC \
         --load_name max_f1 \
         --result_file ${file_name}
 

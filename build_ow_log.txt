@@ -1,3 +1,0 @@
-day150: known=24064, total=65485, label102=41421
-day270: known=19935, total=61356, label102=41421
-All done.

@@ -27,6 +27,7 @@ WFlib/tools/dummypkt_std.py
 WFlib/tools/evaluator.py
 WFlib/tools/iat.py
 WFlib/tools/meantime.py
+WFlib/tools/merge_npz.py
 WFlib/tools/model_utils.py
 WFlib/tools/netclr_augmentor.py
 WFlib/tools/netclr_pretrain.py

@@ -2,14 +2,17 @@ import torch
 import numpy as np
 from torch import nn
 from einops.layers.torch import Rearrange
-from timm.models.layers import trunc_normal_
-from timm.models.layers import DropPath, Mlp
+from timm.layers import trunc_normal_
+from timm.layers import DropPath, Mlp
+
 
 class TopM_MHSA(nn.Module):
     def __init__(self, embed_dim, num_heads, num_mhsa_layers, dim_feedforward, dropout, top_m):
         super().__init__()
 
-        self.nets = nn.ModuleList([MHSA_Block(embed_dim, num_heads, dim_feedforward, dropout, top_m) for _ in range(num_mhsa_layers)])
+        self.nets = nn.ModuleList(
+            [MHSA_Block(embed_dim, num_heads, dim_feedforward, dropout, top_m) for _ in range(num_mhsa_layers)]
+        )
 
     def forward(self, x, pos_embed):
         output = x + pos_embed
@@ -17,16 +20,17 @@ class TopM_MHSA(nn.Module):
             output = layer(output)
         return output
 
+
 class TopMAttention(nn.Module):
     def __init__(self, dim, num_heads, dropout, top_m):
         super().__init__()
-        
+
         self.num_heads = num_heads
         head_dim = dim // num_heads
-        self.scale = head_dim ** -0.5
+        self.scale = head_dim**-0.5
         self.top_m = top_m
 
-        self.qkv = nn.Linear(dim , dim*3)
+        self.qkv = nn.Linear(dim, dim * 3)
         self.attn_drop = nn.Sequential(
             nn.Softmax(dim=-1),
             nn.Dropout(dropout),
@@ -37,10 +41,9 @@ class TopMAttention(nn.Module):
         )
         self.apply(self._init_weights)
 
-
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
-            trunc_normal_(m.weight, std=.02)
+            trunc_normal_(m.weight, std=0.02)
             if isinstance(m, nn.Linear) and m.bias is not None:
                 nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.LayerNorm):
@@ -55,13 +58,14 @@ class TopMAttention(nn.Module):
         attn = (q @ k.transpose(-2, -1)) * self.scale
         mask = torch.zeros(B, self.num_heads, N, N, device=q.device, requires_grad=False)
         index = torch.topk(attn, k=self.top_m, dim=-1, largest=True)[1]
-        mask.scatter_(-1, index, 1.)
-        attn = torch.where(mask>0, attn, torch.full_like(attn, float('-inf')))
+        mask.scatter_(-1, index, 1.0)
+        attn = torch.where(mask > 0, attn, torch.full_like(attn, float("-inf")))
 
         attn = self.attn_drop(attn)
-        x = (attn @ v).transpose(1,2).reshape(B, N, C)
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
         x = self.proj_drop(x)
         return x
+
 
 class MHSA_Block(nn.Module):
 
@@ -84,12 +88,24 @@ class ConvBlock1d(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, dilation=1):
         super(ConvBlock1d, self).__init__()
         self.net = nn.Sequential(
-            nn.Conv1d(in_channels=in_channels, out_channels=out_channels,kernel_size=kernel_size,dilation=dilation, padding="same"),
+            nn.Conv1d(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=kernel_size,
+                dilation=dilation,
+                padding="same",
+            ),
             nn.BatchNorm1d(out_channels),
             nn.ReLU(),
-            nn.Conv1d(in_channels=out_channels, out_channels=out_channels,kernel_size=kernel_size,dilation=dilation, padding="same"),
+            nn.Conv1d(
+                in_channels=out_channels,
+                out_channels=out_channels,
+                kernel_size=kernel_size,
+                dilation=dilation,
+                padding="same",
+            ),
             nn.BatchNorm1d(out_channels),
-            nn.ReLU()
+            nn.ReLU(),
         )
         self.downsample = nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels else None
         if self.downsample is not None:
@@ -103,10 +119,11 @@ class ConvBlock1d(nn.Module):
 
 
 class LocalProfiling(nn.Module):
-    """ Local Profiling module in ARES """
+    """Local Profiling module in ARES"""
+
     def __init__(self):
         super(LocalProfiling, self).__init__()
-        
+
         self.net = nn.Sequential(
             ConvBlock1d(in_channels=1, out_channels=32, kernel_size=7),
             nn.MaxPool1d(kernel_size=8, stride=4),
@@ -126,8 +143,12 @@ class LocalProfiling(nn.Module):
         x = self.net(x)
         return x
 
+
 class ARES(nn.Module):
-    def __init__(self, num_classes, ):
+    def __init__(
+        self,
+        num_classes,
+    ):
         super(ARES, self).__init__()
 
         embed_dim = 256
@@ -137,12 +158,12 @@ class ARES(nn.Module):
         dropout = 0.1
         max_len = 32
         top_m = 20
-        
+
         self.dividing = nn.Sequential(
-            Rearrange('b c (n p) -> (b n) c p', n=4),
+            Rearrange("b c (n p) -> (b n) c p", n=4),
         )
         self.combination = nn.Sequential(
-            Rearrange('(b n) c p -> b c (n p)', n=4),
+            Rearrange("(b n) c p -> b c (n p)", n=4),
         )
         self.profiling = LocalProfiling()
         self.pos_embed = nn.Embedding(max_len, embed_dim).weight
@@ -162,9 +183,10 @@ class ARES(nn.Module):
         x = self.mlp(feat)
         return x, feat
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     net = ARES(num_classes=100)
-    x = np.random.rand(4, 1,10000)
+    x = np.random.rand(4, 1, 10000)
     x = torch.tensor(x, dtype=torch.float32)
     out, _ = net(x)
     print(f"in:{x.shape} --> out:{out.shape}, {_.shape}")

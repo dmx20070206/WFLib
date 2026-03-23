@@ -1,4 +1,4 @@
-Metadata-Version: 2.1
+Metadata-Version: 2.4
 Name: WFlib
 Version: 0.1
 Summary: Library for website fingerprinting attacks
@@ -11,3 +11,6 @@ Requires-Dist: einops
 Requires-Dist: timm
 Requires-Dist: pytorch-metric-learning
 Requires-Dist: captum
+Dynamic: author
+Dynamic: requires-dist
+Dynamic: summary

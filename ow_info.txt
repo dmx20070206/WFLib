@@ -1,7 +1,0 @@
-day14.npz: total=64024, known(0-101)=22603(35.3%), unknown(102)=41421(64.7%)
-day150.npz: total=65485, known(0-101)=24064(36.7%), unknown(102)=41421(63.3%)
-day270.npz: total=61356, known(0-101)=19935(32.5%), unknown(102)=41421(67.5%)
-day30.npz: total=64288, known(0-101)=22867(35.6%), unknown(102)=41421(64.4%)
-day90.npz: total=70020, known(0-101)=28599(40.8%), unknown(102)=41421(59.2%)
-train.npz: total=31863, known(0-101)=19439(61.0%), unknown(102)=12424(39.0%)
-valid.npz: total=2632, known(0-101)=2160(82.1%), unknown(102)=472(17.9%)

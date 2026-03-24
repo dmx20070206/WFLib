@@ -34,7 +34,7 @@ for p in [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]:
     cur_y = []
     abs_X = np.absolute(X)
 
-    for idx in tqdm(range(X.shape[0])):
+    for idx in tqdm(range(X.shape[0]), dynamic_ncols=True):
         tmp_X = abs_X[idx]
         loading_time = tmp_X.max()
         threshold = loading_time * p / 100

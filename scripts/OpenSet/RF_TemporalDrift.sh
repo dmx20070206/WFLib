@@ -23,7 +23,7 @@ python -u exp/train.py \
     --unknown_label 102 \
     --dataset ${dataset} \
     --model ${model} \
-    --device cuda:2 \
+    --device cuda:7 \
     --train_file tam_train \
     --use_extra_train_file tam_bg_train \
     --valid_file tam_valid \
@@ -49,7 +49,7 @@ do
         --open_set \
         --dataset ${dataset} \
         --model ${model} \
-        --device cuda:1 \
+        --device cuda:7 \
         --test_file tam_${file_name} \
         --use_extra_test_file tam_bg_tune \
         --feature TAM \
@@ -63,7 +63,7 @@ do
         --unknown_label 102 \
         --dataset ${dataset} \
         --model ${model} \
-        --device cuda:3 \
+        --device cuda:7 \
         --train_file tam_train \
         --use_extra_train_file tam_bg_train \
         --test_file tam_${file_name} \

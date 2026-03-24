@@ -82,7 +82,7 @@ def resolve_extra_train_path(raw_path, dataset_dir):
 
 def load_splits_with_progress(file_specs, feature, seq_len, num_tabs):
     loaded = {}
-    for split_name, split_path in tqdm(file_specs, desc="Loading datasets", unit="file", leave=False):
+    for split_name, split_path in tqdm(file_specs, desc="Loading datasets", unit="file", leave=False, dynamic_ncols=True):
         loaded[split_name] = data_processor.load_data(split_path, feature, seq_len, num_tabs)
     return loaded
 

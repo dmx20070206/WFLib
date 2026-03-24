@@ -138,7 +138,7 @@ def resolve_optional_npz_path(raw_path, dataset_dir):
 
 def load_splits_with_progress(file_specs):
     loaded = {}
-    for split_name, split_path in tqdm(file_specs, desc="Loading datasets", unit="file", leave=False):
+    for split_name, split_path in tqdm(file_specs, desc="Loading datasets", unit="file", leave=False, dynamic_ncols=True):
         loaded[split_name] = data_processor.load_data(
             split_path,
             args.feature,
@@ -330,6 +330,7 @@ def adapt_model(backbone, train_data, train_labels, test_data, test_labels, tau_
             desc=f"Epoch {epoch+1:03d}/{args.adapt_epochs}",
             unit="batch",
             leave=False,
+            dynamic_ncols=True,
         ):
             origin_batch = next(origin_iter)
             known_batch = next(known_iter)
@@ -381,9 +382,10 @@ def adapt_model(backbone, train_data, train_labels, test_data, test_labels, tau_
                 + (1 - w) * torch.relu(args.energy_m_out - adapt_energies)
             ).mean()
 
-            eng_loss = 0.3 * eng_loss_sk + 0.3 * eng_loss_suk + 0.5 * eng_loss_target
+            eng_loss = eng_loss_sk + eng_loss_suk + eng_loss_target
 
-            w_cls, w_pse, w_mmd, w_ent, w_eng = 1.0, 1.0, 1.0, 1.0, 1.0
+            w_cls, w_pse, w_mmd, w_ent, w_eng = 1.0, 1.0, 1.0, 1.0, 0.5
+            w_eng = 1.0 - (epoch / args.adapt_epochs)
             total_loss = w_cls * cls_loss + w_pse * pse_loss + w_mmd * mmd_loss + w_ent * ent_loss + w_eng * eng_loss
             total_loss.backward()
             optimizer.step()

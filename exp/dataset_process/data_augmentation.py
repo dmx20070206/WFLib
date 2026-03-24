@@ -25,7 +25,7 @@ def gen_augment(data, num_aug, effective_ranges, out_file):
     feat_length = X.shape[1]
 
     # Loop through each sample in the dataset
-    for index in tqdm(range(abs_X.shape[0])):
+    for index in tqdm(range(abs_X.shape[0]), dynamic_ncols=True):
         cur_abs_X = abs_X[index]
         cur_web = y[index]
         loading_time = cur_abs_X.max()

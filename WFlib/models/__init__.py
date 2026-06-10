@@ -10,3 +10,5 @@ from .VarCNN import VarCNN
 from .NetCLR import NetCLR, DFsimCLR
 from .Holmes import Holmes
 from .MultiTabRF import MultiTabRF
+from .Swallow import Swallow, SwallowEncoder, ProjectionHead
+from .Proteus import Proteus

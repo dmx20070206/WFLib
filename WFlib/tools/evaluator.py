@@ -5,6 +5,17 @@ from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_sc
 from sklearn.metrics import roc_auc_score
 
 
+def resolve_unknown_label(y_true, unknown_label=None):
+    y_true_arr = np.asarray(y_true)
+    if y_true_arr.size == 0:
+        return None
+
+    if unknown_label is not None and np.any(y_true_arr == unknown_label):
+        return int(unknown_label)
+
+    return int(np.max(y_true_arr))
+
+
 def precision_at_k(y_true, y_pred, k):
     top_k_preds = np.argsort(y_pred, axis=1)[:, -k:]
     precisions = []
@@ -24,7 +35,7 @@ def average_precision_at_k(y_true, y_pred, k):
     return res
 
 
-def measurement(y_true, y_pred, eval_metrics, num_tabs=1):
+def measurement(y_true, y_pred, eval_metrics, num_tabs=1, y_score=None, unknown_label=None):
     """
     Calculate evaluation metrics for the given true and predicted labels.
 
@@ -47,22 +58,14 @@ def measurement(y_true, y_pred, eval_metrics, num_tabs=1):
         elif eval_metric == "F1-score":
             results[eval_metric] = round(f1_score(y_true, y_pred, average="macro"), 4)
         elif eval_metric == "Closed-F1":
-            unknown_label = int(np.max(y_true))
-            known_mask = np.asarray(y_true) != unknown_label
+            resolved_unknown_label = resolve_unknown_label(y_true, unknown_label)
+            known_mask = np.asarray(y_true) != resolved_unknown_label
             if np.any(known_mask):
                 results[eval_metric] = round(
                     f1_score(np.asarray(y_true)[known_mask], np.asarray(y_pred)[known_mask], average="macro"), 4
                 )
             else:
                 results[eval_metric] = float("nan")
-        elif eval_metric == "Open-AUROC":
-            unknown_label = int(np.max(y_true))
-            y_true_bin = (np.asarray(y_true) == unknown_label).astype(np.int32)
-            y_score = (np.asarray(y_pred) == unknown_label).astype(np.float32)
-            if y_true_bin.min() == y_true_bin.max():
-                results[eval_metric] = float("nan")
-            else:
-                results[eval_metric] = round(roc_auc_score(y_true_bin, y_score), 4)
         elif eval_metric == "P@min":
             results[eval_metric] = round(np.min(precision_score(y_true, y_pred, average=None)), 4)
         elif eval_metric == "r-Precision":

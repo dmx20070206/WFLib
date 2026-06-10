@@ -5,12 +5,20 @@ import json
 import torch.nn.functional as F
 from pytorch_metric_learning import miners, losses
 from sklearn.metrics.pairwise import cosine_similarity
-from .evaluator import measurement
+from .evaluator import measurement, resolve_unknown_label
 from tqdm import tqdm
 import warnings
 
 warnings.filterwarnings("ignore")
 os.environ["PYTHONWARNINGS"] = "ignore"
+
+
+def split_model_outputs(raw_outs):
+    if isinstance(raw_outs, (tuple, list)):
+        logits = raw_outs[0]
+        feature = raw_outs[1] if len(raw_outs) > 1 else raw_outs[0]
+        return logits, feature
+    return raw_outs, raw_outs
 
 
 def knn_monitor(net, device, memory_data_loader, test_data_loader, num_classes, k=200, t=0.1):
@@ -39,7 +47,7 @@ def knn_monitor(net, device, memory_data_loader, test_data_loader, num_classes, 
         # Generate feature bank
         # Use tqdm
         for data, target in tqdm(memory_data_loader, desc="kNN: Building Memory Bank", leave=False, dynamic_ncols=True):
-            feature = net(data.to(device))
+            _, feature = split_model_outputs(net(data.to(device)))
             feature = F.normalize(feature, dim=1)
             feature_bank.append(feature)
             feature_labels.append(target)
@@ -51,7 +59,7 @@ def knn_monitor(net, device, memory_data_loader, test_data_loader, num_classes, 
         # Use tqdm
         for data, target in tqdm(test_data_loader, desc="kNN: Predicting", leave=False, dynamic_ncols=True):
             data, target = data.to(device), target.to(device)
-            feature = net(data)
+            _, feature = split_model_outputs(net(data))
             feature = F.normalize(feature, dim=1)
             pred_labels = knn_predict(feature, feature_bank, feature_labels, num_classes, k, t)
             total_num += data.size(0)
@@ -113,16 +121,56 @@ def fast_count_burst(arr):
     return adjusted_lengths
 
 
-def _filter_unknown_labels(y_true, y_pred, num_tabs, ignore_unknown_label=False, unknown_label=102):
-    if not ignore_unknown_label or num_tabs != 1:
-        return y_true, y_pred
+def measure_open_set(
+    y_true,
+    y_pred,
+    eval_metrics,
+    num_tabs,
+    y_score=None,
+    open_set=False,
+):
+    if not open_set or num_tabs != 1:
+        return measurement(y_true, y_pred, eval_metrics, num_tabs, y_score=y_score, unknown_label=None)
 
-    mask = y_true != unknown_label
-    if mask.ndim > 1:
-        mask = mask.squeeze()
-    if not np.any(mask):
-        raise ValueError("No known-class samples left after filtering unknown labels.")
-    return y_true[mask], y_pred[mask]
+    full_label_metrics = {"Precision", "Recall", "F1-score", "Closed-F1"}
+    filtered_metrics = [metric for metric in eval_metrics if metric not in full_label_metrics]
+    full_metrics = [metric for metric in eval_metrics if metric in full_label_metrics]
+    results = {}
+    resolved_unknown_label = resolve_unknown_label(y_true)
+
+    if filtered_metrics:
+        mask = np.asarray(y_true) != resolved_unknown_label
+        if mask.ndim > 1:
+            mask = mask.squeeze()
+        if not np.any(mask):
+            raise ValueError("No known-class samples left after filtering unknown labels.")
+
+        filtered_true = np.asarray(y_true)[mask]
+        filtered_pred = np.asarray(y_pred)[mask]
+        filtered_score = None
+        if y_score is not None:
+            filtered_score = np.asarray(y_score)
+            if filtered_score.shape[0] != mask.shape[0]:
+                raise ValueError("y_score and y_true must have the same number of samples before filtering.")
+            filtered_score = filtered_score[mask]
+
+        results.update(
+            measurement(
+                filtered_true,
+                filtered_pred,
+                filtered_metrics,
+                num_tabs,
+                y_score=filtered_score,
+                unknown_label=resolved_unknown_label,
+            )
+        )
+
+    if full_metrics:
+        results.update(
+            measurement(y_true, y_pred, full_metrics, num_tabs, y_score=y_score, unknown_label=resolved_unknown_label)
+        )
+
+    return results
 
 
 def model_train(
@@ -140,12 +188,14 @@ def model_train(
     device,
     lradj,
     open_set=False,
-    unknown_label=102,
-    use_energy_loss=False,
-    energy_weight=0.1,
-    energy_m_in=-12.0,
-    energy_m_out=-6.0,
+    energy_args=None,
 ):
+    use_energy_loss, energy_weight, energy_m_in, energy_m_out = energy_args
+    unknown_label = None
+    if open_set and num_tabs == 1:
+        train_labels = train_iter.dataset.tensors[1]
+        unknown_label = int(train_labels.max().item())
+
     if loss_name in ["CrossEntropyLoss", "BCEWithLogitsLoss", "MultiLabelSoftMarginLoss"]:
         criterion = eval(f"torch.nn.{loss_name}")()
     elif loss_name == "TripletMarginLoss":
@@ -178,8 +228,7 @@ def model_train(
         for _, cur_data in enumerate(pbar):
             cur_X, cur_y = cur_data[0].to(device), cur_data[1].to(device)
             optimizer.zero_grad()
-            raw_outs = model(cur_X)
-            outs = raw_outs[0] if isinstance(raw_outs, (tuple, list)) else raw_outs
+            logits, features = split_model_outputs(model(cur_X))
 
             loss_terms = []
             in_mask = None
@@ -190,26 +239,26 @@ def model_train(
                 out_mask = ~in_mask
 
             if loss_name == "TripletMarginLoss":
-                hard_pairs = miner(outs, cur_y)
-                loss_terms.append(criterion(outs, cur_y, hard_pairs))
+                hard_pairs = miner(features, cur_y)
+                loss_terms.append(criterion(features, cur_y, hard_pairs))
             elif loss_name == "SupConLoss":
-                loss_terms.append(criterion(outs, cur_y))
+                loss_terms.append(criterion(features, cur_y))
             elif loss_name == "MultiCrossEntropyLoss":
                 loss_ct_sum = 0
                 cur_indices = torch.nonzero(cur_y)
                 cur_indices = cur_indices[:, 1].view(-1, num_tabs)
                 for ct in range(num_tabs):
-                    loss_ct = criterion(outs[:, ct], cur_indices[:, ct])
+                    loss_ct = criterion(logits[:, ct], cur_indices[:, ct])
                     loss_ct_sum = loss_ct_sum + loss_ct
                 loss_terms.append(loss_ct_sum)
             elif loss_name == "CrossEntropyLoss" and open_set and num_tabs == 1:
                 if in_mask.any():
-                    loss_terms.append(criterion(outs[in_mask], cur_y[in_mask]))
+                    loss_terms.append(criterion(logits[in_mask], cur_y[in_mask]))
             else:
-                loss_terms.append(criterion(outs, cur_y))
+                loss_terms.append(criterion(logits, cur_y))
 
             if use_energy_loss:
-                energy = -torch.logsumexp(outs, dim=1)
+                energy = -torch.logsumexp(logits, dim=1)
                 energy_in = torch.tensor(0.0, device=device)
                 energy_out = torch.tensor(0.0, device=device)
 
@@ -228,12 +277,13 @@ def model_train(
             loss.backward()
             optimizer.step()
 
-            sum_loss += float(loss.detach().cpu().item()) * outs.shape[0]
-            sum_count += outs.shape[0]
+            sum_loss += float(loss.detach().cpu().item()) * logits.shape[0]
+            sum_count += logits.shape[0]
             pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
 
         train_loss = round(sum_loss / max(sum_count, 1), 3)
 
+        valid_score = []
         if loss_name in ["TripletMarginLoss", "SupConLoss"]:
             valid_true, valid_pred = knn_monitor(model, device, train_iter, valid_iter, num_classes, 10)
         else:
@@ -242,7 +292,9 @@ def model_train(
                 valid_pred = []
                 valid_true = []
 
-                val_pbar = tqdm(valid_iter, desc=f"Epoch {epoch + 1:03d}/{train_epochs} [Valid]", leave=False, dynamic_ncols=True)
+                val_pbar = tqdm(
+                    valid_iter, desc=f"Epoch {epoch + 1:03d}/{train_epochs} [Valid]", leave=False, dynamic_ncols=True
+                )
 
                 for _, cur_data in enumerate(val_pbar):
                     cur_X, cur_y = cur_data[0].to(device), cur_data[1].to(device)
@@ -253,6 +305,7 @@ def model_train(
                         cur_pred = torch.sigmoid(outs)
                     elif loss_name == "CrossEntropyLoss":
                         cur_pred = torch.argsort(outs, dim=1, descending=True)[:, 0]
+                        valid_score.append(torch.softmax(outs, dim=1).cpu().numpy())
                     elif loss_name == "MultiCrossEntropyLoss":
                         cur_indices = torch.argmax(outs, dim=-1).cpu()
                         cur_pred = torch.zeros((cur_indices.shape[0], num_classes))
@@ -267,16 +320,23 @@ def model_train(
 
                 valid_pred = np.concatenate(valid_pred)
                 valid_true = np.concatenate(valid_true)
+                if valid_score:
+                    valid_score_arr = np.concatenate(valid_score)
+                    resolved_unknown_label = resolve_unknown_label(valid_true, unknown_label)
+                    valid_score = (
+                        valid_score_arr[:, resolved_unknown_label]
+                        if resolved_unknown_label is not None and resolved_unknown_label < valid_score_arr.shape[1]
+                        else None
+                    )
 
-        valid_true, valid_pred = _filter_unknown_labels(
+        valid_result = measure_open_set(
             valid_true,
             valid_pred,
+            eval_metrics,
             num_tabs,
-            ignore_unknown_label=open_set,
-            unknown_label=unknown_label,
+            y_score=valid_score,
+            open_set=open_set,
         )
-
-        valid_result = measurement(valid_true, valid_pred, eval_metrics, num_tabs)
 
         res_str = ", ".join([f"{k}: {v:.4f}" for k, v in valid_result.items()])
         print(f"Epoch {epoch + 1:03d} | Loss: {train_loss:.4f} | {res_str}")
@@ -304,19 +364,24 @@ def model_eval(
     out_file,
     num_classes,
     ckp_path,
-    scenario,
     num_tabs,
     device,
-    ignore_unknown_label=False,
-    unknown_label=102,
+    open_set=False,
 ):
     print(f"{'=' * 20} Start Evaluation ({eval_method}) {'=' * 20}")
+
+    y_score = None
+    unknown_label = None
+    if open_set and num_tabs == 1:
+        test_labels = test_iter.dataset.tensors[1]
+        unknown_label = int(test_labels.max().item())
 
     if eval_method == "common":
         with torch.no_grad():
             model.eval()
             y_pred = []
             y_true = []
+            y_score_list = []
 
             pbar = tqdm(test_iter, desc="Evaluating", leave=False, dynamic_ncols=True)
             for _, cur_data in enumerate(pbar):
@@ -326,6 +391,7 @@ def model_eval(
 
                 if num_tabs == 1:
                     cur_pred = torch.argsort(outs, dim=1, descending=True)[:, 0]
+                    y_score_list.append(torch.softmax(outs, dim=1).cpu().numpy())
                 else:
                     if len(outs.shape) <= 2:
                         cur_pred = torch.sigmoid(outs)
@@ -341,6 +407,13 @@ def model_eval(
 
             y_pred = np.concatenate(y_pred)
             y_true = np.concatenate(y_true)
+            y_score_arr = np.concatenate(y_score_list)
+            resolved_unknown_label = resolve_unknown_label(y_true, unknown_label)
+            y_score = (
+                y_score_arr[:, resolved_unknown_label]
+                if resolved_unknown_label is not None and resolved_unknown_label < y_score_arr.shape[1]
+                else None
+            )
     elif eval_method == "kNN":
         y_true, y_pred = knn_monitor(model, device, valid_iter, test_iter, num_classes, 10)
     elif eval_method == "Holmes":
@@ -368,7 +441,9 @@ def model_eval(
                 all_sims -= webs_radius
                 outs = np.argmin(all_sims, axis=1)
 
-                if scenario == "Open-world":
+                if open_set:
+                    if unknown_label is None:
+                        unknown_label = int(np.max(cur_y))
                     outs_d = np.min(all_sims, axis=1)
                     open_indices = np.where(outs_d > open_threshold)[0]
                     outs[open_indices] = unknown_label
@@ -380,15 +455,14 @@ def model_eval(
     else:
         raise ValueError(f"Evaluation method {eval_method} is not matched.")
 
-    y_true, y_pred = _filter_unknown_labels(
+    result = measure_open_set(
         y_true,
         y_pred,
+        eval_metrics,
         num_tabs,
-        ignore_unknown_label=ignore_unknown_label,
-        unknown_label=unknown_label,
+        y_score=y_score,
+        open_set=open_set,
     )
-
-    result = measurement(y_true, y_pred, eval_metrics, num_tabs)
 
     res_str = ", ".join([f"{k}: {v:.4f}" for k, v in result.items()])
     print(f"Result: {res_str}")

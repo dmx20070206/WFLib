@@ -2,66 +2,64 @@ import os
 import sys
 import json
 import random
-import warnings
 import argparse
-
+import warnings
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.mixture import GaussianMixture
 from tqdm.auto import tqdm
-
 from WFlib import models
-from WFlib.tools import data_processor, evaluator
-
-sys.path.append(os.path.dirname(__file__))
-from utils.debug import *
+from WFlib.tools import data_processor, model_utils
+from WFlib.tools.debug import *
 
 warnings.filterwarnings("ignore")
 os.environ["PYTHONWARNINGS"] = "ignore"
 
 
-parser = argparse.ArgumentParser(description="WFlib")
+# --- Arguments ----------------------------------------------------------------
+
+parser = argparse.ArgumentParser(description="Proteus Open-Set Adaptation")
+
 parser.add_argument("--dataset", type=str, required=True)
 parser.add_argument("--model", type=str, required=True)
 parser.add_argument("--device", type=str, default="cpu")
 parser.add_argument("--num_tabs", type=int, default=1)
-parser.add_argument("--scenario", type=str, default="Closed-world")
 
-parser.add_argument("--train_file", type=str, default="train")
-parser.add_argument("--use_extra_train_file", type=str, default=None)
-parser.add_argument("--test_file", type=str, default="test")
-parser.add_argument("--use_extra_tune_file", type=str, default=None)
+parser.add_argument("--train_file", type=str, required=True)
+parser.add_argument("--extra_train_file", type=str, default=None)
+parser.add_argument("--tune_file", type=str, default=None)
+parser.add_argument("--extra_tune_file", type=str, default=None)
+parser.add_argument("--test_file", type=str, required=True)
+parser.add_argument("--extra_test_file", type=str, default=None)
 parser.add_argument("--feature", type=str, default="DIR")
 parser.add_argument("--seq_len", type=int, default=5000)
 
 parser.add_argument("--num_workers", type=int, default=10)
 parser.add_argument("--batch_size", type=int, default=256)
+parser.add_argument("--adapt_epochs", type=int, default=100)
+parser.add_argument("--adapt_lr", type=float, default=1e-4)
+parser.add_argument("--split_refresh", type=int, default=5)
+parser.add_argument("--pseudo_refresh", type=int, default=5)
+parser.add_argument("--pseudo_threshold", type=float, default=0.6)
 
-parser.add_argument("--eval_method", type=str, default="common")
+parser.add_argument("--energy_temperature", type=float, default=1.0)
+parser.add_argument("--tau_pct", type=float, default=99.0)
+parser.add_argument("--tau_ema", type=float, default=0.99)
+parser.add_argument("--energy_m_in", type=float, default=-12.0)
+parser.add_argument("--energy_m_out", type=float, default=-2.0)
+parser.add_argument("--energy_loss_weight", type=float, default=0.2)
+
 parser.add_argument("--eval_metrics", nargs="+", required=True, type=str)
 parser.add_argument("--log_path", type=str, default="./logs/")
 parser.add_argument("--checkpoints", type=str, default="./checkpoints/")
 parser.add_argument("--load_name", type=str, default="base")
 parser.add_argument("--result_file", type=str, default="result")
 parser.add_argument("--model_save_name", type=str, default="proteus")
-
-parser.add_argument("--adapt_epochs", type=int, default=100)
-parser.add_argument("--adapt_lr", type=float, default=1e-4)
-parser.add_argument("--split_refresh", type=int, default=2, help="Re-split target every N epochs")
-parser.add_argument("--pseudo_refresh", type=int, default=5, help="Refresh pseudo labels every N epochs")
-parser.add_argument("--pseudo_threshold", type=float, default=0.6, help="Min softmax confidence for pseudo labeling")
-
-parser.add_argument("--energy_temperature", type=float, default=1.0)
-parser.add_argument("--tau_low_pct", type=float, default=99.0, help="Percentile of energy distribution for tau_low")
-parser.add_argument("--tau_high_pct", type=float, default=99.0, help="Percentile of energy distribution for tau_high")
-
-parser.add_argument("--energy_m_in", type=float, default=-12.0)
-parser.add_argument("--energy_m_out", type=float, default=-2.0)
-
+parser.add_argument("--tune_unknown_ratio", type=float, default=2.0)
+parser.add_argument("--tune_known_keep_ratio", type=float, default=1.0)
 parser.add_argument("--fix_seed", type=int, default=20070206)
-parser.add_argument("--unknown_label", type=int, default=102)
 
 args = parser.parse_args()
 
@@ -70,242 +68,262 @@ torch.manual_seed(args.fix_seed)
 np.random.seed(args.fix_seed)
 
 
-# --- Core Utilities -----------------------------------------------------------
+# --- Utilities ----------------------------------------------------------------
 
 
-def compute_gaussian_kernel(source, target):
-    """Gaussian kernel matrix for MMD computation."""
+def gaussian_kernel(source, target):
     n = source.size(0) + target.size(0)
     combined = torch.cat([source, target], dim=0)
     l2 = ((combined.unsqueeze(0) - combined.unsqueeze(1)) ** 2).sum(2)
-    bw = (l2.sum() / (n**2 - n)).clamp(min=1e-5)
+    bw = l2.sum() / (n**2 - n)
     return torch.exp(-l2 / bw)
 
 
-def calculate_mmd_loss(src_feat, tgt_feat):
-    """Maximum Mean Discrepancy between source and target feature distributions."""
+def mmd_loss(src_feat, tgt_feat):
     bs = min(src_feat.size(0), tgt_feat.size(0))
     src_feat, tgt_feat = src_feat[:bs], tgt_feat[:bs]
-    k = compute_gaussian_kernel(src_feat, tgt_feat)
+    k = gaussian_kernel(src_feat, tgt_feat)
     return (k[:bs, :bs] + k[bs:, bs:] - k[:bs, bs:] - k[bs:, :bs]).mean()
 
 
-def compute_softmax_entropy(logits):
-    """Per-sample softmax entropy H(p)."""
+def softmax_entropy(logits):
     return -(logits.softmax(1) * logits.log_softmax(1)).sum(1)
 
 
-def compute_energy(logits, temperature=1.0):
-    """Energy score E(x) = -T * logsumexp(logits / T)."""
-    return -temperature * torch.logsumexp(logits / temperature, dim=1)
+def energy_score(logits, T=1.0):
+    return -T * torch.logsumexp(logits / T, dim=1)
 
 
-def compute_energy_weights(energies, tau_center, gamma):
-    """Map energy scores to known-class confidence weights via sigmoid.
-
-    w_i = 1 / (1 + exp((E_i - tau_center) / gamma))
-
-    Low energy (known-like)  -> w near 1.
-    High energy (unknown-like) -> w near 0.
-    gamma controls sharpness: larger = smoother, smaller = closer to hard threshold.
-    """
+def energy_weights(energies, tau_center, gamma):
     return torch.sigmoid(-(energies - tau_center) / gamma)
 
 
 def infinite_iter(loader):
-    """Infinite iterator that cycles through a DataLoader indefinitely."""
     while True:
         yield from loader
 
 
-def ensure_npz_suffix(path_str):
-    return path_str if path_str.endswith(".npz") else f"{path_str}.npz"
+def load_and_merge(file_list):
+    all_data, all_labels = [], []
+    for f in file_list:
+        name = f if f.endswith(".npz") else f"{f}.npz"
+        data, labels = data_processor.load_data(name, args.feature, args.seq_len, args.num_tabs)
+        all_data.append(data)
+        all_labels.append(labels)
+    return torch.cat(all_data), torch.cat(all_labels)
 
 
-def resolve_optional_npz_path(raw_path, dataset_dir):
-    normalized = ensure_npz_suffix(raw_path)
-    candidates = [normalized]
-    if not os.path.isabs(normalized):
-        candidates.append(os.path.join(dataset_dir, normalized))
-        candidates.append(os.path.join("./datasets", normalized))
-
-    for candidate in candidates:
-        if os.path.exists(candidate):
-            return candidate
-
-    raise FileNotFoundError(f"Extra tune file not found: {raw_path}. Tried: {candidates}")
+def infer_unknown_label(labels):
+    return int(labels.max().item())
 
 
-def load_splits_with_progress(file_specs):
-    loaded = {}
-    for split_name, split_path in tqdm(file_specs, desc="Loading datasets", unit="file", leave=False, dynamic_ncols=True):
-        loaded[split_name] = data_processor.load_data(
-            split_path,
-            args.feature,
-            args.seq_len,
-            args.num_tabs,
+def rebalance_tune_data(data, labels, unknown_label):
+    if args.tune_unknown_ratio <= 0:
+        raise ValueError("tune_unknown_ratio must be positive")
+
+    if not (0 < args.tune_known_keep_ratio <= 1):
+        raise ValueError("tune_known_keep_ratio must be in the range (0, 1]")
+
+    if labels.ndim != 1:
+        raise ValueError("tune_unknown_ratio only supports 1D labels")
+
+    known_idx = torch.where(labels != unknown_label)[0]
+    unknown_idx = torch.where(labels == unknown_label)[0]
+    known_count = int(known_idx.numel())
+    unknown_count = int(unknown_idx.numel())
+
+    if known_count == 0:
+        print(
+            f"Tune ratio skipped: known={known_count}, unknown={unknown_count}, "
+            f"requested 1:{args.tune_unknown_ratio:g}"
         )
-    return loaded
+        return data, labels
+
+    if unknown_count == 0:
+        known_selected_idx = known_idx
+        unknown_selected_idx = unknown_idx
+        ratio_known = known_count
+        ratio_unknown = unknown_count
+        print(
+            f"Tune ratio skipped: known={known_count}, unknown={unknown_count}, "
+            f"requested 1:{args.tune_unknown_ratio:g}"
+        )
+    else:
+        keep_known = min(known_count, int(unknown_count / args.tune_unknown_ratio))
+        keep_unknown = min(unknown_count, int(round(keep_known * args.tune_unknown_ratio)))
+
+        if keep_known == 0 or keep_unknown == 0:
+            keep_known = min(known_count, 1)
+            keep_unknown = min(unknown_count, max(1, int(round(keep_known * args.tune_unknown_ratio))))
+
+        known_perm = torch.randperm(known_count)[:keep_known]
+        unknown_perm = torch.randperm(unknown_count)[:keep_unknown]
+        known_selected_idx = known_idx[known_perm]
+        unknown_selected_idx = unknown_idx[unknown_perm]
+        ratio_known = int(known_selected_idx.numel())
+        ratio_unknown = int(unknown_selected_idx.numel())
+
+    final_known = ratio_known
+    final_unknown = ratio_unknown
+    if args.tune_known_keep_ratio < 1.0:
+        if ratio_known > 0:
+            final_known = max(1, int(ratio_known * args.tune_known_keep_ratio))
+            known_selected_idx = known_selected_idx[torch.randperm(ratio_known)[:final_known]]
+        if ratio_unknown > 0:
+            final_unknown = max(1, int(ratio_unknown * args.tune_known_keep_ratio))
+            unknown_selected_idx = unknown_selected_idx[torch.randperm(ratio_unknown)[:final_unknown]]
+
+    selected_idx = torch.cat([known_selected_idx, unknown_selected_idx])
+    selected_idx = selected_idx[torch.randperm(selected_idx.numel())]
+
+    final_known = int(known_selected_idx.numel())
+    final_unknown = int(unknown_selected_idx.numel())
+    actual_ratio = final_unknown / final_known if final_known > 0 else float("inf")
+    print(
+        f"Tune sampling: requested ratio 1:{args.tune_unknown_ratio:g}, "
+        f"known keep={args.tune_known_keep_ratio:g}, "
+        f"ratio-stage known={ratio_known}, unknown={ratio_unknown}, "
+        f"final known={final_known}, unknown={final_unknown} (actual 1:{actual_ratio:.2f})"
+    )
+    return data[selected_idx], labels[selected_idx]
 
 
-# --- Energy-Based Three-Way Split ---------------------------------------------
+# --- Energy Splitting ---------------------------------------------------------
 
 
-def compute_source_energy_thresholds(model, source_data, device):
-    """Compute tau_low and tau_high as percentiles of the source energy distribution.
-    Uses args.tau_low_pct and args.tau_high_pct.
-    """
+def collect_energies(model, data, device):
     model.eval()
-    energies = []
+    chunks = []
     with torch.no_grad():
-        for i in range(0, len(source_data), args.batch_size):
-            batch = torch.as_tensor(source_data[i : i + args.batch_size]).to(device)
+        for i in range(0, len(data), args.batch_size):
+            batch = torch.as_tensor(data[i : i + args.batch_size]).to(device)
             logits, _ = model(batch)
-            energies.append(compute_energy(logits, args.energy_temperature).cpu().numpy())
-    energies = np.concatenate(energies)
-    tau_low = float(np.percentile(energies, args.tau_low_pct))
-    tau_high = float(np.percentile(energies, args.tau_high_pct))
-    return tau_low, tau_high
+            chunks.append(energy_score(logits, args.energy_temperature).cpu().numpy())
+    return np.concatenate(chunks)
 
 
-def split_target_by_energy(model, target_data, tau_low, tau_high, device):
-    """Split target samples into three partitions using fixed energy thresholds.
+def compute_energy_threshold(model, source_data, device):
+    energies = collect_energies(model, source_data, device)
+    return float(np.percentile(energies, args.tau_pct))
 
-    Returns:
-        known_mask:   E(x) < tau_low           -- D_t,known
-        unknown_mask: E(x) > tau_high          -- D_t,unknown
-        gray_mask:    tau_low <= E(x) <= tau_high -- D_t,gray (unused for now)
-        energies:     raw energy score per sample
-    """
+
+def predict_unknown_mask(model, eval_data, tau, device, eval_labels=None):
+    known_mask = collect_energies(model, eval_data, device) < tau
+    if eval_labels is not None:
+        eval_labels_np = np.asarray(eval_labels)
+        print_energy_detection_stats(known_mask, eval_labels_np, int(eval_labels_np.max()), tau)
+    return ~known_mask
+
+
+# --- Pseudo Labels ------------------------------------------------------------
+
+
+def gmm_clean_probs(model, data_loader, device):
+    all_ent, all_pred = [], []
     model.eval()
-    energies = []
     with torch.no_grad():
-        for i in range(0, len(target_data), args.batch_size):
-            batch = torch.as_tensor(target_data[i : i + args.batch_size]).to(device)
-            logits, _ = model(batch)
-            energies.append(compute_energy(logits, args.energy_temperature).cpu().numpy())
-    energies = np.concatenate(energies)
-    known_mask = energies < tau_low
-    unknown_mask = energies > tau_high
-    gray_mask = ~known_mask & ~unknown_mask
-    return known_mask, unknown_mask, gray_mask, energies
-
-
-# --- Pseudo Label Selection ---------------------------------------------------
-
-
-def compute_gmm_probabilities(model, data_loader, device):
-    """Use GMM on entropy distribution to estimate per-sample clean probability."""
-    entropies = []
-    predictions = []
-    with torch.no_grad():
-        model.eval()
         for batch in data_loader:
-            inputs = batch[0].to(device)
-            outputs, _ = model(inputs)
-            preds = torch.argsort(outputs, dim=1, descending=True)[:, 0]
-            entropies.append(compute_softmax_entropy(outputs).cpu().numpy())
-            predictions.append(preds.cpu().numpy())
-    entropies = np.concatenate(entropies).flatten()
-    predictions = np.concatenate(predictions).flatten()
-    entropies = (entropies - entropies.min()) / (entropies.max() - entropies.min() + 1e-10)
-    entropies = entropies.reshape(-1, 1)
-    predictions = torch.tensor(predictions, dtype=torch.int64)
+            logits, _ = model(batch[0].to(device))
+            all_ent.append(softmax_entropy(logits).cpu().numpy())
+            all_pred.append(logits.argmax(1).cpu().numpy())
+    ent = np.concatenate(all_ent).flatten()
+    pred = np.concatenate(all_pred).flatten()
+    ent = (ent - ent.min()) / (ent.max() - ent.min())
     gmm = GaussianMixture(n_components=2, tol=1e-6)
-    gmm.fit(entropies)
-    probabilities = gmm.predict_proba(entropies)
-    low_uncertainty_index = np.argmin(gmm.means_.flatten())
-    return probabilities[:, low_uncertainty_index], predictions
+    gmm.fit(ent.reshape(-1, 1))
+    probs = gmm.predict_proba(ent.reshape(-1, 1))
+    clean_idx = np.argmin(gmm.means_.flatten())
+    return probs[:, clean_idx], torch.tensor(pred, dtype=torch.int64)
 
 
-def create_pseudo_labels(clean_probs, known_data, predictions, threshold, batch_size, num_workers):
-    """Build a DataLoader for samples whose GMM clean probability >= threshold."""
-    clean_indices = clean_probs >= threshold
-    pseudo_inputs = torch.as_tensor(known_data[clean_indices], dtype=torch.float32)
-    pseudo_labels = predictions[clean_indices]
-    return data_processor.load_iter(pseudo_inputs, pseudo_labels, batch_size, True, num_workers)
+def make_pseudo_loader(probs, data, predictions, threshold):
+    mask = probs >= threshold
+    inputs = torch.as_tensor(data[mask], dtype=torch.float32)
+    labels = predictions[mask]
+    return data_processor.load_iter(inputs, labels, args.batch_size, True, args.num_workers)
 
 
 # --- Evaluation ---------------------------------------------------------------
 
 
-def evaluate_open_set(model, test_data, test_labels, unknown_mask, device):
-    """Run model inference; assign args.unknown_label to detected-unknown samples."""
+def evaluate(model, test_data, test_labels, unknown_mask, device):
     model.eval()
     preds = []
     with torch.no_grad():
         for i in range(0, len(test_data), args.batch_size):
             batch = torch.as_tensor(test_data[i : i + args.batch_size]).to(device)
-            preds.append(model(batch)[0].argmax(dim=1).cpu().numpy())
+            preds.append(model(batch)[0].argmax(1).cpu().numpy())
     raw_preds = np.concatenate(preds)
     full_preds = raw_preds.copy()
-    full_preds[unknown_mask] = args.unknown_label
-
-    known_gt = test_labels != args.unknown_label
-    metrics = {}
-    for metric in args.eval_metrics:
-        if metric == "Closed-F1":
-            metrics[metric] = float(
-                evaluator.measurement(test_labels[known_gt], raw_preds[known_gt], [metric]).get(metric, float("nan"))
-            )
-        else:
-            metrics[metric] = float(evaluator.measurement(test_labels, full_preds, [metric]).get(metric, float("nan")))
-    return metrics
+    full_preds[unknown_mask] = infer_unknown_label(test_labels)
+    return model_utils.measure_open_set(test_labels, full_preds, args.eval_metrics, args.num_tabs, open_set=True)
 
 
-# --- Adaptation Loop ----------------------------------------------------------
+def run_single_test(model, test_name, eval_data, eval_labels, source_known_data, device):
+    tau = compute_energy_threshold(model, source_known_data, device)
+    print(f"\n[{test_name}] Energy threshold: tau={tau:.4f}")
+    unknown_mask = predict_unknown_mask(model, eval_data, tau, device, eval_labels=eval_labels)
+    metrics = evaluate(model, eval_data, np.asarray(eval_labels), unknown_mask, device)
+    print(f"[{test_name}] {', '.join(f'{k}: {v:.4f}' for k, v in metrics.items())}")
+    return metrics, tau
 
 
-def adapt_model(backbone, train_data, train_labels, test_data, test_labels, tau_low, tau_high, device):
-    """Adapt backbone with source CE, pseudo labels, MMD, entropy, and energy margin."""
+# --- Adaptation ---------------------------------------------------------------
+
+
+def adapt(backbone, train_data, train_labels, tune_data, tune_labels, tau, device):
     optimizer = torch.optim.Adam(backbone.parameters(), lr=args.adapt_lr)
-    ce_loss_fn = nn.CrossEntropyLoss()
-    tau_center = (tau_low + tau_high) / 2.0
-    test_labels_np = np.asarray(test_labels)
+    ce = nn.CrossEntropyLoss()
+    tau_center = tau
+    tune_labels_np = np.asarray(tune_labels)
+    train_unknown_label = infer_unknown_label(train_labels)
+    tune_unknown_label = infer_unknown_label(tune_labels)
 
-    origin_loader = data_processor.load_iter(train_data, train_labels, args.batch_size, True, args.num_workers)
-    origin_iter = infinite_iter(origin_loader)
-
-    # Full target loader — all samples; soft weights w_i route each sample's loss contribution.
-    adapt_loader = data_processor.load_iter(
-        torch.as_tensor(test_data, dtype=torch.float32),
-        torch.zeros(len(test_data), dtype=torch.int64),
+    src_iter = infinite_iter(
+        data_processor.load_iter(train_data, train_labels, args.batch_size, True, args.num_workers)
+    )
+    # tune_data: unlabeled target domain — used for adaptation only
+    tgt_loader = data_processor.load_iter(
+        torch.as_tensor(tune_data, dtype=torch.float32),
+        torch.zeros(len(tune_data), dtype=torch.int64),
         args.batch_size,
         True,
         args.num_workers,
     )
 
-    # Hard-threshold split retained only for: (a) eval unknown_mask, (b) GMM pseudo-label source.
     known_mask = unknown_mask = None
-    pseudo_loader = pseudo_iter = None
-    known_loader = known_iter = None
+    known_iter = pseudo_iter = None
     known_data = None
-
-    best_score, best_epoch = 0.0, 0
-    monitor = args.eval_metrics[0]
+    best_metrics = {}
 
     for epoch in range(args.adapt_epochs):
 
-        # Re-split target by hard energy thresholds for eval / pseudo-label source.
+        # Refresh energy split
         if epoch % args.split_refresh == 0:
-            known_mask, unknown_mask, _, _ = split_target_by_energy(backbone, test_data, tau_low, tau_high, device)
-            print_energy_detection_stats(
-                known_mask, test_labels_np, args.unknown_label, known_mask.sum(), unknown_mask.sum()
-            )
-            known_data = test_data[known_mask]
-            known_x_all = torch.as_tensor(known_data, dtype=torch.float32)
-            known_loader = data_processor.load_iter(
-                known_x_all,
-                torch.zeros(len(known_x_all), dtype=torch.int64),
-                args.batch_size,
-                True,
-                args.num_workers,
-            )
-            known_iter = infinite_iter(known_loader)
+            src_known_mask = train_labels != train_unknown_label
+            tau_new = compute_energy_threshold(backbone, train_data[src_known_mask], device)
+            tau = args.tau_ema * tau + (1.0 - args.tau_ema) * tau_new
 
-        # Refresh pseudo labels on D_t,known using GMM entropy.
+            known_mask = collect_energies(backbone, tune_data, device) < tau
+            unknown_mask = ~known_mask
+
+            tau_center = tau
+
+            print_energy_detection_stats(known_mask, tune_labels_np, tune_unknown_label, tau)
+            known_data = tune_data[known_mask]
+            known_iter = infinite_iter(
+                data_processor.load_iter(
+                    torch.as_tensor(known_data, dtype=torch.float32),
+                    torch.zeros(len(known_data), dtype=torch.int64),
+                    args.batch_size,
+                    True,
+                    args.num_workers,
+                )
+            )
+
+        # Refresh pseudo labels
         if epoch % args.pseudo_refresh == 0:
-            known_tmp_loader = torch.utils.data.DataLoader(
+            tmp_loader = torch.utils.data.DataLoader(
                 torch.utils.data.TensorDataset(
                     torch.as_tensor(known_data, dtype=torch.float32),
                     torch.zeros(len(known_data), dtype=torch.int64),
@@ -314,105 +332,86 @@ def adapt_model(backbone, train_data, train_labels, test_data, test_labels, tau_
                 shuffle=False,
                 num_workers=args.num_workers,
             )
-            confidences, predictions = compute_gmm_probabilities(backbone, known_tmp_loader, device)
-            pseudo_loader = create_pseudo_labels(
-                confidences, known_data, predictions, args.pseudo_threshold, args.batch_size, args.num_workers
-            )
-            print_gmm_pseudo_stats(confidences, predictions.numpy(), test_labels_np[known_mask], args.pseudo_threshold)
+            confidences, predictions = gmm_clean_probs(backbone, tmp_loader, device)
+            pseudo_loader = make_pseudo_loader(confidences, known_data, predictions, args.pseudo_threshold)
+            print_gmm_pseudo_stats(confidences, predictions.numpy(), tune_labels_np[known_mask], args.pseudo_threshold)
             pseudo_iter = infinite_iter(pseudo_loader)
 
-        # Train one epoch.
+        # Train one epoch
         backbone.train()
-        loss_cls = loss_mmd = loss_pse = loss_ent = loss_eng = n = 0
+        losses = {"cls": 0, "mmd": 0, "pse": 0, "ent": 0, "eng": 0}
+        n = 0
 
-        for adapt_batch in tqdm(
-            adapt_loader,
-            desc=f"Epoch {epoch+1:03d}/{args.adapt_epochs}",
-            unit="batch",
-            leave=False,
-            dynamic_ncols=True,
+        for tgt_batch in tqdm(
+            tgt_loader, desc=f"Epoch {epoch+1:03d}/{args.adapt_epochs}", leave=False, dynamic_ncols=True
         ):
-            origin_batch = next(origin_iter)
-            known_batch = next(known_iter)
-            adapt_x = adapt_batch[0].to(device)  # all target — for energy margin
-            known_x_b = known_batch[0].to(device)  # known target — for MMD + entropy
-            origin_x, origin_y = origin_batch[0].to(device), origin_batch[1].to(device)
+            src_batch = next(src_iter)
+            src_x, src_y = src_batch[0].to(device), src_batch[1].to(device)
+            kn_x = next(known_iter)[0].to(device)
+            tgt_x = tgt_batch[0].to(device)
 
             optimizer.zero_grad()
-            origin_out, origin_feat = backbone(origin_x)
-            adapt_out, _ = backbone(adapt_x)  # full target, only logits needed for energy
-            known_out, known_feat = backbone(known_x_b)  # known target features + logits
+            src_out, src_feat = backbone(src_x)
+            tgt_out, _ = backbone(tgt_x)
+            kn_out, kn_feat = backbone(kn_x)
 
-            # Soft weights computed on the full target batch for energy margin routing.
             with torch.no_grad():
-                w = compute_energy_weights(compute_energy(adapt_out.detach(), args.energy_temperature), tau_center, 1)
+                w = energy_weights(energy_score(tgt_out.detach(), args.energy_temperature), tau_center, 3)
 
-            # Classification loss on known source samples.
-            src_known = origin_y != args.unknown_label
-            src_unknown = ~src_known
-            cls_loss = ce_loss_fn(origin_out[src_known], origin_y[src_known])
+            is_known = src_y != train_unknown_label
+            is_unknown = ~is_known
 
-            # MMD: align source-known features with target-known features only.
-            mmd_loss = calculate_mmd_loss(origin_feat[src_known], known_feat)
+            cls = ce(src_out[is_known], src_y[is_known])
+            mmd = mmd_loss(src_feat[is_known], kn_feat)
 
-            # Entropy minimisation on target-known samples only.
-            softmax_out = F.softmax(known_out, dim=-1)
-            mean_softmax = softmax_out.mean(dim=0)
-            ent_loss = compute_softmax_entropy(known_out).mean(0) + torch.sum(
-                mean_softmax * torch.log(mean_softmax + 1e-5)
-            )
+            p = F.softmax(kn_out, dim=-1)
+            ent = softmax_entropy(kn_out).mean() + (p.mean(0) * torch.log(p.mean(0) + 1e-5)).sum()
 
-            # Pseudo-label loss on GMM-filtered high-confidence samples (hard threshold preserved).
-            pseudo_x, pseudo_y = [t.to(device) for t in next(pseudo_iter)]
-            pse_loss = ce_loss_fn(backbone(pseudo_x)[0], pseudo_y)
+            ps_x, ps_y = [t.to(device) for t in next(pseudo_iter)]
+            pse = ce(backbone(ps_x)[0], ps_y)
 
-            # Source energy margin.
-            eng_loss_sk = torch.relu(compute_energy(origin_out[src_known]) - args.energy_m_in).mean()
-            eng_loss_suk = (
-                torch.relu(args.energy_m_out - compute_energy(origin_out[src_unknown])).mean()
-                if src_unknown.any()
+            eng_k = torch.relu(energy_score(src_out[is_known]) - args.energy_m_in).mean()
+            eng_u = (
+                torch.relu(args.energy_m_out - energy_score(src_out[is_unknown])).mean()
+                if is_unknown.any()
                 else torch.tensor(0.0, device=device)
             )
+            tgt_e = energy_score(tgt_out, args.energy_temperature)
+            eng_t = (w * torch.relu(tgt_e - args.energy_m_in) + (1 - w) * torch.relu(args.energy_m_out - tgt_e)).mean()
+            eng = eng_k + eng_u + 0.2 * eng_t
 
-            # Unified weighted energy margin on target.
-            # w_i -> 1: push energy down (known margin); w_i -> 0: push energy up (unknown margin).
-            adapt_energies = compute_energy(adapt_out, args.energy_temperature)
-            eng_loss_target = (
-                w * torch.relu(adapt_energies - args.energy_m_in)
-                + (1 - w) * torch.relu(args.energy_m_out - adapt_energies)
-            ).mean()
+            w_cls = 1.0
+            w_eng = args.energy_loss_weight
+            w_mmd = 1.0
 
-            eng_loss = eng_loss_sk + eng_loss_suk + eng_loss_target
+            if epoch < args.adapt_epochs // 10:
+                w_pse = 0.1
+                w_ent = 0.1
+            else:
+                w_pse = 1.0
+                w_ent = 1.0
 
-            w_cls, w_pse, w_mmd, w_ent, w_eng = 1.0, 1.0, 1.0, 1.0, 0.5
-            w_eng = 1.0 - (epoch / args.adapt_epochs)
-            total_loss = w_cls * cls_loss + w_pse * pse_loss + w_mmd * mmd_loss + w_ent * ent_loss + w_eng * eng_loss
-            total_loss.backward()
+            total = w_cls * cls + w_mmd * mmd + w_ent * ent + w_pse * pse + w_eng * eng
+            total.backward()
             optimizer.step()
 
-            bs = origin_out.size(0)
-            loss_cls += cls_loss.item() * bs
-            loss_mmd += mmd_loss.item() * bs
-            loss_ent += ent_loss.item() * bs
-            loss_pse += pse_loss.item() * bs
-            loss_eng += eng_loss.item() * bs
+            bs = src_out.size(0)
+            losses["cls"] += cls.item() * bs
+            losses["mmd"] += mmd.item() * bs
+            losses["ent"] += ent.item() * bs
+            losses["pse"] += pse.item() * bs
+            losses["eng"] += eng.item() * bs
             n += bs
 
-        metrics = evaluate_open_set(backbone, test_data, test_labels_np, unknown_mask, device)
-        score = float(metrics.get(monitor, float("nan")))
-        if score > best_score:
-            best_score, best_epoch = score, epoch
+        metrics = evaluate(backbone, tune_data, tune_labels_np, unknown_mask, device)
+        for k, v in metrics.items():
+            if k not in best_metrics or v > best_metrics[k]:
+                best_metrics[k] = v
+        m_str = ", ".join(f"{k}: {v:.4f}" for k, v in metrics.items())
+        l_str = ", ".join(f"{k}: {v / n:.4f}" for k, v in losses.items())
+        print(f"  Epoch {epoch+1:03d} | {m_str} | {l_str}")
 
-        n = max(n, 1)
-        m_str = ", ".join(f"{m}: {metrics.get(m, float('nan')):.4f}" for m in args.eval_metrics)
-        l_str = (
-            f"cls: {loss_cls/n:.4f}, pse: {loss_pse/n:.4f}, "
-            f"ent: {loss_ent/n:.4f}, "
-            f"mmd: {loss_mmd/n:.4f}, eng: {loss_eng/n:.4f}"
-        )
-        print(f" Epoch {epoch+1:03d} | {m_str} | {l_str}")
-
-    return best_score, best_epoch, unknown_mask
+    return unknown_mask, best_metrics
 
 
 # --- Entry Point --------------------------------------------------------------
@@ -420,97 +419,65 @@ def adapt_model(backbone, train_data, train_labels, test_data, test_labels, tau_
 
 def main():
     device = torch.device(args.device)
-
     dataset_path = os.path.join("./datasets", args.dataset)
     log_path = os.path.join(args.log_path, args.dataset, args.model)
     ckp_path = os.path.join(args.checkpoints, args.dataset, args.model)
     os.makedirs(log_path, exist_ok=True)
     os.makedirs(ckp_path, exist_ok=True)
 
-    train_path = os.path.join(dataset_path, ensure_npz_suffix(args.train_file))
-    test_path = os.path.join(dataset_path, ensure_npz_suffix(args.test_file))
+    # Load data
+    train_files = [os.path.join(dataset_path, args.train_file)] + (
+        [os.path.join("./datasets", args.extra_train_file)] if args.extra_train_file else []
+    )
+    tune_files = [os.path.join(dataset_path, args.tune_file)] + (
+        [os.path.join("./datasets", args.extra_tune_file)] if args.extra_tune_file else []
+    )
+    test_files = [os.path.join(dataset_path, args.test_file)] + (
+        [os.path.join("./datasets", args.extra_test_file)] if args.extra_test_file else []
+    )
 
-    file_specs = [("train", train_path), ("test", test_path)]
-    extra_tune_path = None
-    if args.use_extra_tune_file:
-        extra_tune_path = resolve_optional_npz_path(args.use_extra_tune_file, dataset_path)
-        file_specs.append(("extra_tune", extra_tune_path))
-        print(f"[debug] extra tune file: {extra_tune_path}")
-    extra_train_path = None
-    if args.use_extra_train_file:
-        extra_train_path = resolve_optional_npz_path(args.use_extra_train_file, dataset_path)
-        file_specs.append(("extra_train", extra_train_path))
-        print(f"[debug] extra train file: {extra_train_path}")
+    train_data, train_labels = load_and_merge(train_files)
+    tune_data, tune_labels = load_and_merge(tune_files)
+    test_data, test_labels = load_and_merge(test_files)
+    tune_unknown_label = infer_unknown_label(tune_labels)
+    tune_data, tune_labels = rebalance_tune_data(tune_data, tune_labels, tune_unknown_label)
 
-    loaded = load_splits_with_progress(file_specs)
-    train_data, train_labels = loaded["train"]
-    test_data, test_labels = loaded["test"]
+    train_unknown_label = infer_unknown_label(train_labels)
+    num_classes = int(train_labels[train_labels != train_unknown_label].max()) + 1
+    src_known = train_labels != train_unknown_label
+    source_known_data = train_data[src_known]
 
-    if extra_tune_path is not None:
-        extra_tune_data, extra_tune_labels = loaded["extra_tune"]
-        test_data = torch.cat([test_data, extra_tune_data], dim=0)
-        test_labels = torch.cat([test_labels, extra_tune_labels], dim=0)
+    print(f"\nDataset: {args.dataset}, Model: {args.model}, Device: {device}")
+    print(f"Train: {train_data.shape}, Tune: {tune_data.shape}, Test: {test_data.shape}, Classes: {num_classes}")
 
-    if extra_train_path is not None:
-        extra_train_data, extra_train_labels = loaded["extra_train"]
-        train_data = torch.cat([train_data, extra_train_data], dim=0)
-        train_labels = torch.cat([train_labels, extra_train_labels], dim=0)
-
-    train_labels_np = np.asarray(train_labels)
-    known_src_labels = train_labels_np[train_labels_np != args.unknown_label]
-    num_classes = int(known_src_labels.max()) + 1
-
-    print(f"\n{'='*20} Configuration {'='*20}")
-    print(f"Dataset: {args.dataset},  Model: {args.model},  Device: {device}")
-    print(f"Train: {train_data.shape},  Test: {test_data.shape}")
-    print(f"Source classes: {num_classes},  Unknown label: {args.unknown_label}")
-    print(f"Energy tau percentiles: low={args.tau_low_pct}%,  high={args.tau_high_pct}%")
-    print(f"{'='*55}\n")
-
-    # Build and load pretrained backbone.
-    backbone = models.DF(num_classes) if args.model == "DF" else eval(f"models.{args.model}")(num_classes)
+    # Load model
+    backbone = getattr(models, args.model)(num_classes)
     ckp_file = os.path.join(ckp_path, f"{args.load_name}.pth")
-    if os.path.exists(ckp_file):
-        backbone.load_state_dict(torch.load(ckp_file, map_location="cpu"))
-        print(f"Loaded pretrained backbone from {ckp_file}")
+    backbone.load_state_dict(torch.load(ckp_file, map_location="cpu"))
     backbone.to(device)
+    print(f"Loaded: {ckp_file}")
 
-    # Summarise pre-adaptation energy distributions using ground-truth labels.
-    test_labels_np = np.asarray(test_labels)
+    # Test before adaptation
+    pre_test_metrics, tau = run_single_test(backbone, "Pre-Adapt Test", test_data, test_labels, source_known_data, device)
+    print()
 
-    # Compute tau_low and tau_high from source or target domain depending on args.tau_from_source.
-    src_known_mask = train_labels_np != args.unknown_label
-    tau_low, tau_high = compute_source_energy_thresholds(backbone, train_data[src_known_mask], device)
-    print(f"\nEnergy thresholds: tau_low={tau_low:.4f},  tau_high={tau_high:.4f}")
-    print(f"{'='*65}\n")
+    # Adapt
+    _, best_metrics = adapt(backbone, train_data, train_labels, tune_data, tune_labels, tau, device)
 
-    print(f"\n{'='*20} Adaptation {'='*20}")
-    best_score, best_epoch, unknown_mask = adapt_model(
-        backbone, train_data, train_labels, test_data, test_labels, tau_low, tau_high, device
-    )
-    print(f"Done.  Best {args.eval_metrics[0]}: {best_score:.4f}  (epoch {best_epoch + 1})")
+    # Test after adaptation
+    post_test_metrics, _ = run_single_test(backbone, "Post-Adapt Test", test_data, test_labels, source_known_data, device)
 
-    print(f"\n{'='*20} Final Evaluation {'='*20}")
-    final_metrics = evaluate_open_set(backbone, test_data, test_labels_np, unknown_mask, device)
-    final_result = {m: float(final_metrics.get(m, float("nan"))) for m in args.eval_metrics}
-    final_result.update(
-        {
-            "best_primary_score": float(best_score),
-            "best_primary_epoch": int(best_epoch),
-        }
-    )
-    m_str = ", ".join(f"{m}: {final_result[m]:.4f}" for m in args.eval_metrics)
-    print(f"Final | {m_str}")
-    print(f"{'='*55}\n")
+    metrics = {f"pre_{k}": v for k, v in pre_test_metrics.items()}
+    metrics.update(post_test_metrics)
+    metrics.update({f"post_{k}": v for k, v in post_test_metrics.items()})
+    for k, v in best_metrics.items():
+        metrics[f"best_{k}"] = v
+    print(f"\nFinal: {', '.join(f'{k}: {v:.4f}' for k, v in post_test_metrics.items())}")
 
-    model_path = os.path.join(ckp_path, f"{args.model_save_name}.pth")
-    torch.save(backbone.state_dict(), model_path)
-    print(f"Adapted model saved -> {model_path}")
-
-    output_file = os.path.join(log_path, f"{args.result_file}.json")
-    with open(output_file, "w") as f:
-        json.dump(final_result, f, indent=4)
-    print(f"Results saved     -> {output_file}")
+    # Save
+    torch.save(backbone.state_dict(), os.path.join(ckp_path, f"{args.model_save_name}.pth"))
+    with open(os.path.join(log_path, f"{args.result_file}.json"), "w") as f:
+        json.dump(metrics, f, indent=4)
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@ for dataset in Defense
 do
 model=TF
 
-python -u exp/train.py \
+python -u -m exp.train \
   --dataset ${dataset} \
   --model ${model} \
   --device cuda:6 \
@@ -19,7 +19,7 @@ python -u exp/train.py \
 
 for file_name in test day14 day30 day90 day150 day270
 do
-    python -u exp/test.py \
+    python -u -m exp.test \
     --dataset ${dataset} \
     --model ${model} \
     --device cuda:6 \

@@ -1,10 +1,10 @@
 dataset=NetworkDrift
 model=TikTok
 
-python -u exp/train.py \
+python -u -m exp.train \
   --dataset ${dataset} \
   --model ${model} \
-  --device cuda:1 \
+  --device cuda:5 \
   --feature DT \
   --seq_len 5000 \
   --train_epochs 30 \
@@ -21,10 +21,10 @@ do
     cp checkpoints/${dataset}/${model}/max_f1.pth checkpoints/${dataset}/${model}/proteus.pth
     wait
     
-    python -u exp/test.py \
+    python -u -m exp.test \
     --dataset ${dataset} \
     --model ${model} \
-    --device cuda:1 \
+    --device cuda:5 \
     --test_file ${file_name} \
     --feature DT \
     --seq_len 5000 \
@@ -33,10 +33,10 @@ do
     --load_name max_f1 \
     --result_file ${file_name}
   
-    python -u exp/proteus.py \
+    python -u -m exp/proteus.py \
         --dataset ${dataset} \
         --model ${model} \
-        --device cuda:1 \
+        --device cuda:5 \
         --train_file train \
         --test_file ${file_name} \
         --feature DT \

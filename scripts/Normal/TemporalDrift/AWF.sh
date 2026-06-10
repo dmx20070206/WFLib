@@ -1,10 +1,10 @@
 dataset=TemporalDrift
 model=AWF
 
-python -u exp/train.py \
+python -u -m exp.train \
   --dataset ${dataset} \
   --model ${model} \
-  --device cuda:1 \
+  --device cuda:5 \
   --feature DIR \
   --seq_len 3000 \
   --train_epochs 30 \
@@ -22,10 +22,10 @@ wait
 
 for file_name in test day14 day30 day90 day150 day270
 do
-    python -u exp/test.py \
+    python -u -m exp.test \
         --dataset ${dataset} \
         --model ${model} \
-        --device cuda:1 \
+        --device cuda:5 \
         --test_file ${file_name} \
         --feature DIR \
         --seq_len 3000 \
@@ -34,10 +34,10 @@ do
         --load_name max_f1 \
         --result_file ${file_name}
 
-    python -u exp/proteus.py \
+    python -u -m exp/proteus.py \
         --dataset ${dataset} \
         --model ${model} \
-        --device cuda:1 \
+        --device cuda:5 \
         --train_file train \
         --test_file ${file_name} \
         --feature DIR \

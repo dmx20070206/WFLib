@@ -6,8 +6,7 @@ import argparse
 import numpy as np
 from WFlib import models
 from sklearn.mixture import GaussianMixture
-from WFlib.tools import data_processor, evaluator
-from torch.utils.data import DataLoader
+from WFlib.tools import data_processor, evaluator, model_utils
 import torch.nn.functional as F
 import warnings
 
@@ -39,7 +38,7 @@ def compute_softmax_entropy(logits):
     return -(logits.softmax(1) * logits.log_softmax(1)).sum(1)
 
 
-def evaluate_model(model, data_loader, metrics, device):
+def evaluate_model(model, data_loader, metrics, device, open_set=False, num_tabs=1):
     with torch.no_grad():
         model.eval()
         predictions = []
@@ -52,7 +51,7 @@ def evaluate_model(model, data_loader, metrics, device):
             ground_truths.append(labels.cpu().numpy())
         predictions = np.concatenate(predictions)
         ground_truths = np.concatenate(ground_truths)
-    return evaluator.measurement(ground_truths, predictions, metrics)
+    return model_utils.measure_open_set(ground_truths, predictions, metrics, num_tabs, open_set=open_set)
 
 
 def compute_gmm_probabilities(model, data_loader, device):
@@ -85,12 +84,22 @@ def create_pseudo_labels(clean_probs, inputs, labels, threshold, batch_size, num
     return data_processor.load_iter(pseudo_inputs, pseudo_labels, batch_size, True, num_workers)
 
 
-def adapt_model(model, test_data, adapt_data_loader, origin_data_loader, test_data_loader, metrics, device, threshold):
+def adapt_model(
+    model,
+    test_data,
+    adapt_data_loader,
+    origin_data_loader,
+    test_data_loader,
+    metrics,
+    device,
+    threshold,
+    open_set,
+    num_tabs,
+):
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     origin_data_iter = iter(origin_data_loader)
     loss_function = torch.nn.CrossEntropyLoss()
-    best_f1_score = 0
-    best_epoch = 0
+    best_results = {}
     for epoch in range(100):
         if epoch % 5 == 0:
             clean_probs, pseudo_labels = compute_gmm_probabilities(model, test_data_loader, device)
@@ -134,12 +143,50 @@ def adapt_model(model, test_data, adapt_data_loader, origin_data_loader, test_da
             entropy_loss_sum += entropy_loss.data.cpu().numpy() * origin_outputs.shape[0]
             pseudo_loss_sum += pseudo_loss.data.cpu().numpy() * origin_outputs.shape[0]
             total_samples += adapt_outputs.shape[0]
-        epoch_result = evaluate_model(model, test_data_loader, metrics, device)
+        epoch_result = evaluate_model(model, test_data_loader, metrics, device, open_set, num_tabs)
         print(f"{epoch}:", epoch_result)
-        if epoch_result["F1-score"] > best_f1_score:
-            best_f1_score = epoch_result["F1-score"]
-            best_epoch = epoch
-    return best_f1_score, best_epoch
+        for metric_name, metric_val in epoch_result.items():
+            if metric_name not in best_results or metric_val > best_results[metric_name]:
+                best_results[metric_name] = metric_val
+    return best_results
+
+
+def load_and_merge(file_list):
+    all_data, all_labels = [], []
+    for f in file_list:
+        print(f"merge {f}")
+        name = f if f.endswith(".npz") else f"{f}.npz"
+        data, labels = data_processor.load_data(name, args.feature, args.seq_len, args.num_tabs)
+        all_data.append(data)
+        all_labels.append(labels)
+    return torch.cat(all_data), torch.cat(all_labels)
+
+
+def rebalance_tune_data(data, labels):
+    unknown_label = int(labels.max().item())
+    known_idx = torch.where(labels != unknown_label)[0]
+    unknown_idx = torch.where(labels == unknown_label)[0]
+    known_count = int(known_idx.numel())
+    unknown_count = int(unknown_idx.numel())
+
+    keep_known = min(known_count, int(unknown_count / args.tune_unknown_ratio))
+    keep_unknown = min(unknown_count, int(round(keep_known * args.tune_unknown_ratio)))
+
+    if keep_known == 0 or keep_unknown == 0:
+        keep_known = min(known_count, 1)
+        keep_unknown = min(unknown_count, max(1, int(round(keep_known * args.tune_unknown_ratio))))
+
+    known_perm = torch.randperm(known_count)[:keep_known]
+    unknown_perm = torch.randperm(unknown_count)[:keep_unknown]
+    selected_idx = torch.cat([known_idx[known_perm], unknown_idx[unknown_perm]])
+    selected_idx = selected_idx[torch.randperm(selected_idx.numel())]
+
+    actual_ratio = keep_unknown / keep_known if keep_known > 0 else float("inf")
+    print(
+        f"Tune ratio: requested 1:{args.tune_unknown_ratio:g}, "
+        f"using known={keep_known}, unknown={keep_unknown} (actual 1:{actual_ratio:.2f})"
+    )
+    return data[selected_idx], labels[selected_idx]
 
 
 # Argument parsing and setup omitted for brevity
@@ -154,13 +201,20 @@ parser.add_argument("--dataset", type=str, required=True, default="CW", help="Da
 parser.add_argument("--model", type=str, required=True, default="DF", help="Model name")
 parser.add_argument("--device", type=str, default="cpu", help="Device, options=[cpu, cuda, cuda:x]")
 parser.add_argument("--num_tabs", type=int, default=1, help="Maximum number of tabs opened by users while browsing")
-parser.add_argument(
-    "--scenario", type=str, default="Closed-world", help="Attack scenario, options=[Closed-world, Open-world]"
-)
+parser.add_argument("--open_set", action="store_true", help="Enable Open-Set adaptation/evaluation (K-class + OOD)")
 
 # Input parameters
 parser.add_argument("--train_file", type=str, default="train", help="Train file")
+parser.add_argument("--extra_train_file", type=str, default=None, help="Extra train file (relative to ./datasets/)")
+parser.add_argument(
+    "--tune_file",
+    type=str,
+    default=None,
+    help="Tune file for adaptation (unlabeled target domain); defaults to test_file if not set",
+)
+parser.add_argument("--extra_tune_file", type=str, default=None, help="Extra tune file (relative to ./datasets/)")
 parser.add_argument("--test_file", type=str, default="test", help="Test file")
+parser.add_argument("--extra_test_file", type=str, default=None, help="Extra test file (relative to ./datasets/)")
 parser.add_argument("--feature", type=str, default="DIR", help="Feature type, options=[DIR, DT, DT2, TAM, TAF]")
 parser.add_argument("--seq_len", type=int, default=5000, help="Input sequence length")
 
@@ -185,6 +239,7 @@ parser.add_argument("--load_name", type=str, default="base", help="Name of the m
 parser.add_argument("--result_file", type=str, default="result", help="File to save test results")
 parser.add_argument("--gmm_threshold", type=float, default=0.6, help="GMM threshold")
 parser.add_argument("--model_save_name", type=str, default="proteus", help="Name used to save the model")
+parser.add_argument("--tune_unknown_ratio", type=float, default=2.0, help="Tune known:unknown target ratio 1:r")
 
 # Parse arguments
 args = parser.parse_args()
@@ -204,49 +259,66 @@ os.makedirs(log_path, exist_ok=True)
 output_file = os.path.join(log_path, f"{args.result_file}.json")
 
 # Load training and validation data
-print(f"Loading test file: ", os.path.join(dataset_path, f"{args.test_file}.npz"))
-train_data, train_labels = data_processor.load_data(
-    os.path.join(dataset_path, f"{args.train_file}.npz"), args.feature, args.seq_len, args.num_tabs
+train_files = [os.path.join(dataset_path, f"{args.train_file}.npz")] + (
+    [os.path.join("./datasets", args.extra_train_file)] if args.extra_train_file else []
 )
-test_data, test_labels = data_processor.load_data(
-    os.path.join(dataset_path, f"{args.test_file}.npz"), args.feature, args.seq_len, args.num_tabs
+_tune_name = args.tune_file if args.tune_file else args.test_file
+_extra_tune_name = args.extra_tune_file if args.extra_tune_file else args.extra_test_file
+tune_files = [os.path.join(dataset_path, f"{_tune_name}.npz")] + (
+    [os.path.join("./datasets", _extra_tune_name)] if _extra_tune_name else []
 )
-num_classes = len(np.unique(test_labels))
+train_data, train_labels = load_and_merge(train_files)
+tune_data, tune_labels = load_and_merge(tune_files)
+if args.open_set and args.num_tabs == 1:
+    tune_data, tune_labels = rebalance_tune_data(tune_data, tune_labels)
 
+if args.test_file != _tune_name or args.extra_test_file != _extra_tune_name:
+    print("Test arguments are kept for compatibility but ignored; using tune data for adaptation and evaluation.")
+
+test_data, test_labels = tune_data, tune_labels
 if args.num_tabs == 1:
-    num_classes = len(np.unique(test_labels))
-    assert num_classes == test_labels.max() + 1, "Labels are not continuous"
+    if args.open_set:
+        unknown_label = int(tune_labels.max().item())
+        known_tune_labels = tune_labels[tune_labels != unknown_label]
+        if known_tune_labels.numel() == 0:
+            raise ValueError("No known-class samples found in tune/test set for Open-Set mode.")
+        num_classes = int(known_tune_labels.max().item()) + 1
+    else:
+        num_classes = len(np.unique(tune_labels))
+        assert num_classes == tune_labels.max() + 1, "Labels are not continuous"
 else:
-    num_classes = test_labels.shape[1]
+    num_classes = tune_labels.shape[1]
 
 # Print dataset information
 print(f"Train data shape: X={train_data.shape}, y={train_labels.shape}")
-print(f"Test data shape: X={test_data.shape}, y={test_labels.shape}")
+print(f"Tune/Test data shape: X={tune_data.shape}, y={tune_labels.shape}")
 print(f"Number of classes: {num_classes}")
 
 # Load data into iterators
 origin_data_loader = data_processor.load_iter(train_data, train_labels, args.batch_size, True, args.num_workers)
 adapt_data_loader = data_processor.load_iter(
-    test_data, torch.zeros_like(test_labels), args.batch_size, True, args.num_workers
+    tune_data, torch.zeros(len(tune_data), dtype=torch.int64), args.batch_size, True, args.num_workers
 )
 test_data_loader = data_processor.load_iter(test_data, test_labels, args.batch_size, False, args.num_workers)
 
 # Initialize model, optimizer, and loss function
+ckpt_state_dict = torch.load(os.path.join(ckp_path, f"{args.load_name}.pth"), map_location="cpu")
+
 if args.model in ["BAPM", "TMWF"]:
     model = eval(f"models.{args.model}")(num_classes, args.num_tabs)
 else:
     model = eval(f"models.{args.model}")(num_classes)
 
-model.load_state_dict(torch.load(os.path.join(ckp_path, f"{args.load_name}.pth"), map_location="cpu"))
+model.load_state_dict(ckpt_state_dict)
 model.to(device)
 
 # Evaluation before adaptation
-initial_result = evaluate_model(model, test_data_loader, args.eval_metrics, device)
+initial_result = evaluate_model(model, test_data_loader, args.eval_metrics, device, args.open_set, args.num_tabs)
 print("Initial evaluation result:")
 print(initial_result)
 
 # Model adaptation
-best_f1_score, best_epoch = adapt_model(
+best_results = adapt_model(
     model,
     test_data,
     adapt_data_loader,
@@ -255,12 +327,14 @@ best_f1_score, best_epoch = adapt_model(
     args.eval_metrics,
     device,
     args.gmm_threshold,
+    args.open_set,
+    args.num_tabs,
 )
 
 # Evaluation after adaptation
-final_result = evaluate_model(model, test_data_loader, args.eval_metrics, device)
-final_result["best_f1_score"] = best_f1_score
-final_result["best_f1_epoch"] = best_epoch
+final_result = evaluate_model(model, test_data_loader, args.eval_metrics, device, args.open_set, args.num_tabs)
+for k, v in best_results.items():
+    final_result[f"best_{k}"] = v
 print("Evaluation after adaptation:")
 print(final_result)
 

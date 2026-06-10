@@ -2,6 +2,7 @@ import torch
 import numpy as np
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from . import swallow_utils
 
 def length_align(X, seq_len):
     """
@@ -60,6 +61,9 @@ def load_data(data_path, feature_type, seq_len, num_tab=1):
     elif feature_type in ["TAF", "MTAF"]:
         X = length_align(X, seq_len)
         X = torch.tensor(X, dtype=torch.float32)
+    elif feature_type == "CIF":
+        X, _, _ = swallow_utils.build_cif_features(X, show_progress=False)
+        X = torch.tensor(X[:, np.newaxis], dtype=torch.float32)
     elif feature_type == "Origin":
         X = length_align(X, seq_len)
         return X, y

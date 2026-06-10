@@ -1,7 +1,7 @@
 dataset=NetworkDrift
 model=TF
 
-python -u exp/train.py \
+python -u -m exp.train \
   --dataset ${dataset} \
   --model ${model} \
   --device cuda:7 \
@@ -18,7 +18,7 @@ python -u exp/train.py \
 
 for file_name in SG USA UK JP DE
 do
-    python -u exp/test.py \
+    python -u -m exp.test \
     --dataset ${dataset} \
     --model ${model} \
     --device cuda:7 \

@@ -47,12 +47,14 @@ class TF(nn.Module):
             nn.Flatten(),  # Flatten the tensor to a vector
             nn.Linear(filter_num[3] * length_after_extraction, 64),  # Fully connected layer
         )
+        self.mlp = nn.Linear(64, num_classes)
 
     def forward(self, x):
         # Pass the input through the feature extraction part
         feature = self.feature_extraction(x)
         
         # Pass the output through the classifier part
-        logit = self.classifier(x)
+        feat = self.classifier(feature)
+        logit = self.mlp(feat)
         
-        return feature, logit
+        return logit, feat

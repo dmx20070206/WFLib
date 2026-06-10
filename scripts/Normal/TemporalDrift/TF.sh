@@ -1,7 +1,7 @@
 dataset=TemporalDrift
 model=TF
 
-python -u exp/train.py \
+python -u -m exp.train \
   --dataset ${dataset} \
   --model ${model} \
   --device cuda:2 \
@@ -23,7 +23,7 @@ wait
 
 for file_name in day14 day30 day90 day150 day270
 do
-    python -u exp/test.py \
+    python -u -m exp.test \
     --dataset ${dataset} \
     --model ${model} \
     --device cuda:2 \
@@ -36,7 +36,7 @@ do
     --load_name max_f1 \
     --result_file ${file_name}
 
-    python -u exp/proteus_type2.py \
+    python -u -m exp/proteus_type2.py \
     --dataset ${dataset} \
     --model ${model} \
     --device cuda:2 \

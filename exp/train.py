@@ -7,7 +7,7 @@ import numpy as np
 from multiprocessing import freeze_support
 from tqdm import tqdm
 from WFlib import models
-from WFlib.tools import data_processor, model_utils
+from WFlib.tools import data_processor, model_utils, swallow_utils
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -27,17 +27,16 @@ def parse_args():
     parser.add_argument("--model", type=str, required=True, default="DF", help="Model name")
     parser.add_argument("--device", type=str, default="cpu", help="Device, options=[cpu, cuda, cuda:x]")
     parser.add_argument("--num_tabs", type=int, default=1, help="Maximum number of tabs opened by users while browsing")
+
+    # Open-set training parameters
     parser.add_argument("--open_set", action="store_true", help="Enable Open-set training with unknown-label handling")
-    parser.add_argument(
-        "--unknown_label", type=int, default=102, help="Label id used for unknown class samples in Open-set"
-    )
 
     # Input parameters
     parser.add_argument("--train_file", type=str, default="train", help="Train file")
     parser.add_argument("--valid_file", type=str, default="valid", help="Valid file")
-    parser.add_argument("--use_extra_train_file", type=str, default=None)
-    parser.add_argument("--use_extra_valid_file", type=str, default=None)
-    parser.add_argument("--feature", type=str, default="DIR", help="Feature type, options=[DIR, DT, DT2, TAM, TAF]")
+    parser.add_argument("--extra_train_file", type=str, default=None)
+    parser.add_argument("--extra_valid_file", type=str, default=None)
+    parser.add_argument("--feature", type=str, default="DIR", help="Feature type, options=[DIR, DT, DT2, TAM, TAF, CIF]")
     parser.add_argument("--seq_len", type=int, default=5000, help="Input sequence length")
 
     # Optimization parameters
@@ -48,12 +47,14 @@ def parse_args():
     parser.add_argument("--optimizer", type=str, default="Adam", help="Optimizer")
     parser.add_argument("--loss", type=str, default="CrossEntropyLoss", help="Loss function")
     parser.add_argument("--lradj", type=str, default="None", help="adjust learning rate, option=[None, StepLR]")
-    parser.add_argument("--use_energy_loss", action="store_true")
-    parser.add_argument("--energy_weight", type=float, default=0.3, help="Weight of energy loss term")
-    parser.add_argument("--energy_m_in", type=float, default=-18.0, help="Known-class energy margin m_in")
+
+    # Energy-based OOD detection parameters
+    parser.add_argument("--use_energy_loss", action="store_true", help="Whether to use energy-based loss")
+    parser.add_argument("--energy_weight", type=float, default=0.5, help="Weight of energy loss term")
+    parser.add_argument("--energy_m_in", type=float, default=-20.0, help="Known-class energy margin m_in")
     parser.add_argument("--energy_m_out", type=float, default=-2.0, help="Unknown-class energy margin m_out")
 
-    # Output parameters
+    # Output parameter
     parser.add_argument("--eval_metrics", nargs="+", required=True, type=str)
     parser.add_argument("--save_metric", type=str, default="F1-score")
     parser.add_argument("--checkpoints", type=str, default="./checkpoints/", help="Location of model checkpoints")
@@ -66,23 +67,11 @@ def ensure_npz_suffix(path_str):
     return path_str if path_str.endswith(".npz") else f"{path_str}.npz"
 
 
-def resolve_extra_train_path(raw_path, dataset_dir):
-    normalized = ensure_npz_suffix(raw_path)
-    candidates = [normalized]
-    if not os.path.isabs(normalized):
-        candidates.append(os.path.join(dataset_dir, normalized))
-        candidates.append(os.path.join("./datasets", normalized))
-
-    for candidate in candidates:
-        if os.path.exists(candidate):
-            return candidate
-
-    raise FileNotFoundError(f"Extra train file not found: {raw_path}. Tried: {candidates}")
-
-
 def load_splits_with_progress(file_specs, feature, seq_len, num_tabs):
     loaded = {}
-    for split_name, split_path in tqdm(file_specs, desc="Loading datasets", unit="file", leave=False, dynamic_ncols=True):
+    for split_name, split_path in tqdm(
+        file_specs, desc="Loading datasets", unit="file", leave=False, dynamic_ncols=True
+    ):
         loaded[split_name] = data_processor.load_data(split_path, feature, seq_len, num_tabs)
     return loaded
 
@@ -94,8 +83,6 @@ def main():
         raise ValueError("Open-set mode currently supports only num_tabs=1.")
 
     # Ensure the specified device is available
-    if args.device.startswith("cuda"):
-        assert torch.cuda.is_available(), f"The specified device {args.device} does not exist"
     device = torch.device(args.device)
 
     # Define paths for dataset and checkpoints
@@ -118,15 +105,13 @@ def main():
     extra_train_path = None
     extra_valid_path = None
 
-    if args.use_extra_train_file:
-        extra_train_path = resolve_extra_train_path(args.use_extra_train_file, in_path)
+    if args.extra_train_file:
+        extra_train_path = os.path.join("./datasets", ensure_npz_suffix(args.extra_train_file))
         file_specs.append(("extra_train", extra_train_path))
-        print(f"[debug] extra train file: {extra_train_path}")
 
-    if args.use_extra_valid_file:
-        extra_valid_path = resolve_extra_train_path(args.use_extra_valid_file, in_path)
+    if args.extra_valid_file:
+        extra_valid_path = os.path.join("./datasets", ensure_npz_suffix(args.extra_valid_file))
         file_specs.append(("extra_valid", extra_valid_path))
-        print(f"[debug] extra valid file: {extra_valid_path}")
 
     loaded_data = load_splits_with_progress(file_specs, args.feature, args.seq_len, args.num_tabs)
     train_X, train_y = loaded_data["train"]
@@ -142,20 +127,17 @@ def main():
         valid_X = torch.cat([valid_X, extra_X], dim=0)
         valid_y = torch.cat([valid_y, extra_y], dim=0)
 
+    unknown_label = None
+    # if open-set training is enabled, separate known and unknown samples based on the unknown label
     if args.num_tabs == 1:
         if args.open_set:
-            known_train_mask = train_y != args.unknown_label
+            unknown_label = int(train_y.max().item())
+            known_train_mask = train_y != unknown_label
             known_train_y = train_y[known_train_mask]
-            if known_train_y.numel() == 0:
-                raise ValueError("No known-class samples found in training set for Open-set mode.")
             num_classes = int(known_train_y.max().item()) + 1
-            assert num_classes == len(torch.unique(known_train_y)), "Known labels are not continuous"
-            print(
-                f"Open-set enabled: known={known_train_mask.sum().item()}, unknown={(~known_train_mask).sum().item()}"
-            )
+            print(f"Open-set: known={known_train_mask.sum().item()}, unknown={(~known_train_mask).sum().item()}")
         else:
-            num_classes = len(np.unique(train_y))
-            assert num_classes == train_y.max() + 1, "Labels are not continuous"
+            num_classes = int(train_y.max().item()) + 1
     else:
         num_classes = train_y.shape[1]
 
@@ -179,18 +161,28 @@ def main():
         print("No pre-trained model")
     else:
         print("Loading the pretrained model in ", args.load_file)
-        checkpoint = torch.load(args.load_file)
+        if args.model == "Swallow":
+            swallow_utils.load_pretrained_encoder(model, args.load_file, map_location="cpu")
+        else:
+            checkpoint = torch.load(args.load_file)
 
-        for k in list(checkpoint.keys()):
-            if k.startswith("backbone."):
-                if k.startswith("backbone") and not k.startswith("backbone.fc"):
-                    checkpoint[k[len("backbone.") :]] = checkpoint[k]
-            del checkpoint[k]
+            for k in list(checkpoint.keys()):
+                if k.startswith("backbone."):
+                    if k.startswith("backbone") and not k.startswith("backbone.fc"):
+                        checkpoint[k[len("backbone.") :]] = checkpoint[k]
+                del checkpoint[k]
 
-        log = model.load_state_dict(checkpoint, strict=False)
-        assert log.missing_keys == ["fc.weight", "fc.bias"]
+            log = model.load_state_dict(checkpoint, strict=False)
+            assert log.missing_keys == ["fc.weight", "fc.bias"]
 
     model.to(device)
+
+    energy_args = [
+        args.use_energy_loss,
+        args.energy_weight,
+        args.energy_m_in,
+        args.energy_m_out,
+    ]
 
     # Train the model
     model_utils.model_train(
@@ -208,11 +200,7 @@ def main():
         device,
         args.lradj,
         args.open_set,
-        args.unknown_label,
-        args.use_energy_loss,
-        args.energy_weight,
-        args.energy_m_in,
-        args.energy_m_out,
+        energy_args,
     )
 
 

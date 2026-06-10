@@ -2,7 +2,7 @@ for dataset in VersionDrift/045 VersionDrift/046 VersionDrift/047 VersionDrift/0
 do
   model=ARES
 
-  python -u exp/train.py \
+  python -u -m exp.train \
     --dataset ${dataset} \
     --model ${model} \
     --device cuda:2 \
@@ -23,7 +23,7 @@ do
 
   for file_name in drift
   do
-      python -u exp/test.py \
+      python -u -m exp.test \
         --dataset ${dataset} \
         --model ${model} \
         --device cuda:2 \
@@ -35,7 +35,7 @@ do
         --load_name max_f1 \
         --result_file ${file_name}
       
-      python -u exp/proteus.py \
+      python -u -m exp/proteus.py \
           --dataset ${dataset} \
           --model ${model} \
           --device cuda:2 \

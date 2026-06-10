@@ -1,7 +1,7 @@
 dataset=BehaviorDrift
 model=NetCLR
 
-python -u exp/pretrain.py \
+python -u -m exp.pretrain \
   --dataset ${dataset} \
   --model ${model} \
   --device cuda:0 \
@@ -12,7 +12,7 @@ python -u exp/pretrain.py \
   --optimizer Adam \
   --save_name pretrain
 
-python -u exp/train.py \
+python -u -m exp.train \
   --dataset ${dataset} \
   --model ${model} \
   --device cuda:0 \
@@ -35,7 +35,7 @@ do
     cp checkpoints/${dataset}/${model}/max_f1.pth checkpoints/${dataset}/${model}/proteus.pth
     wait
     
-    python -u exp/test.py \
+    python -u -m exp.test \
       --dataset ${dataset} \
       --model ${model} \
       --device cuda:0 \
@@ -47,7 +47,7 @@ do
       --load_name max_f1 \
       --result_file ${file_name}
 
-    python -u exp/proteus.py \
+    python -u -m exp/proteus.py \
         --dataset ${dataset} \
         --model ${model} \
         --device cuda:0 \

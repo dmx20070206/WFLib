@@ -296,7 +296,7 @@ def process_TAM(index, sequence, maximum_load_time, max_matrix_len):
 
     for pack in sequence:
         if pack == 0:
-            break  # End of sequence
+            continue  # Skip zero packets
         elif pack > 0:
             if pack >= maximum_load_time:
                 feature[0, -1] += 1  # Assign to the last bin if it exceeds maximum load time

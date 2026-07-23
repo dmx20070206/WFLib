@@ -1,5 +1,7 @@
 dataset=TemporalDrift
 model=Proteus
+checkpoints=./checkpoints/OtherExperiments/SFT_Proteus
+log_path=./logs/OtherExperiments/SFT_Proteus
 
 for filename in bg_train bg_valid bg_tune 
 do
@@ -36,14 +38,37 @@ python -u -m exp.train \
     --eval_metrics Accuracy Precision Recall F1-score \
     --save_metric F1-score \
     --save_name max_f1 \
+    --checkpoints ${checkpoints}
 
 wait
-rm -rf checkpoints/${dataset}/${model}/proteus.pth
-cp checkpoints/${dataset}/${model}/max_f1.pth checkpoints/${dataset}/${model}/proteus.pth
+rm -rf ${checkpoints}/${dataset}/${model}/proteus.pth
+cp ${checkpoints}/${dataset}/${model}/max_f1.pth ${checkpoints}/${dataset}/${model}/proteus.pth
 wait
 
-for file_name in day270 day14 day30 day90 day150
+for file_name in day14 day30 day90 day150 day270 
 do
+    python -u -m exp.sft \
+        --open_set \
+        --dataset ${dataset} \
+        --model ${model} \
+        --device cuda:2 \
+        --tune_file tam_${file_name} \
+        --extra_tune_file tam_bg_tune \
+        --test_file tam_${file_name} \
+        --extra_test_file tam_bg_tune \
+        --feature TAM \
+        --seq_len 1800 \
+        --batch_size 128 \
+        --k_shot 10 \
+        --sft_epochs 60 \
+        --sft_lr 1e-4 \
+        --optimizer Adam \
+        --eval_metrics Accuracy Precision Recall F1-score \
+        --save_metric F1-score \
+        --checkpoints ${checkpoints} \
+        --load_name proteus \
+        --save_name proteus \
+
     python -u -m exp.proteus_os \
         --dataset ${dataset} \
         --model ${model} \
@@ -58,10 +83,12 @@ do
         --seq_len 1800 \
         --batch_size 128 \
         --eval_metrics Accuracy Precision Recall F1-score \
+        --log_path ${log_path} \
+        --checkpoints ${checkpoints} \
         --load_name proteus \
         --model_save_name proteus \
-        --result_file Proteus_${file_name} \
+        --result_file Proteus_SFT_${file_name} \
 
-    rm -rf checkpoints/${dataset}/${model}/proteus.pth
-    cp checkpoints/${dataset}/${model}/max_f1.pth checkpoints/${dataset}/${model}/proteus.pth
+    rm -rf ${checkpoints}/${dataset}/${model}/proteus.pth
+    cp ${checkpoints}/${dataset}/${model}/max_f1.pth ${checkpoints}/${dataset}/${model}/proteus.pth
 done

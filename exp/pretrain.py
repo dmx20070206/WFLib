@@ -87,8 +87,11 @@ def main():
         bursts = netclr_augmentor.find_bursts(x)
         outgoing_burst_sizes += [burst[2] for burst in bursts if burst[2] > 0]
 
+    if not outgoing_burst_sizes:
+        raise ValueError("No outgoing bursts found in the sampled training traces.")
+
     max_outgoing_burst_size = int(max(outgoing_burst_sizes))
-    count, bins = np.histogram(outgoing_burst_sizes, bins=max_outgoing_burst_size - 1)
+    count, bins = np.histogram(outgoing_burst_sizes, bins=max(1, max_outgoing_burst_size - 1))
     pdf = count / np.sum(count)
     outgoing_burst_size_cdf = np.zeros_like(bins)
     outgoing_burst_size_cdf[1:] = np.cumsum(pdf)
@@ -122,6 +125,7 @@ def main():
         num_epoches=args.train_epochs,
         batch_size=args.batch_size,
         out_file=out_file,
+        device=device,
     )
     netclr.train(train_loader)
 

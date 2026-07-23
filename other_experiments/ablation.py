@@ -32,27 +32,29 @@ class StageSpec:
 	use_mmd: bool
 	use_pseudo: bool
 	use_entropy: bool
-	use_energy_loss: bool = False
+	use_energy_loss: bool
 
 
 STAGE_SPECS = {
 	"base": StageSpec(
 		key="base",
 		name="Base",
-		use_energy_filter=False,
-		use_adapt=False,
-		use_mmd=False,
-		use_pseudo=False,
-		use_entropy=False,
-	),
-	"energy": StageSpec(
-		key="energy",
-		name="Base + Energy OSR",
 		use_energy_filter=True,
 		use_adapt=False,
 		use_mmd=False,
 		use_pseudo=False,
 		use_entropy=False,
+        use_energy_loss = False,
+	),
+	"energy": StageSpec(
+		key="energy",
+		name="Base + Energy OSR",
+		use_energy_filter=True,
+		use_adapt=True,
+		use_mmd=False,
+		use_pseudo=False,
+		use_entropy=False,
+        use_energy_loss = True,
 	),
 	"mmd": StageSpec(
 		key="mmd",
@@ -62,15 +64,17 @@ STAGE_SPECS = {
 		use_mmd=True,
 		use_pseudo=False,
 		use_entropy=False,
+        use_energy_loss = True,
 	),
 	"pl": StageSpec(
 		key="pl",
-		name="Base + Energy OSR + MMD + PL",
+		name="Base + Energy OSR + MMD + Entropy",
 		use_energy_filter=True,
 		use_adapt=True,
 		use_mmd=True,
-		use_pseudo=True,
-		use_entropy=False,
+		use_pseudo=False,
+		use_entropy=True,
+        use_energy_loss = True,
 	),
 	"full": StageSpec(
 		key="full",
@@ -80,6 +84,7 @@ STAGE_SPECS = {
 		use_mmd=True,
 		use_pseudo=True,
 		use_entropy=True,
+        use_energy_loss = True,
 	),
 }
 
@@ -614,7 +619,7 @@ def main():
 			)
 		)
 
-	output_dir = os.path.join(args.log_path, args.dataset, args.model, "ablation")
+	output_dir = os.path.join(args.log_path, "OtherExperiments", "Ablation")
 	os.makedirs(output_dir, exist_ok=True)
 	output_path = os.path.join(output_dir, f"{args.result_file}.json")
 	with open(output_path, "w", encoding="utf-8") as handle:

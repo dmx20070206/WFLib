@@ -2,7 +2,7 @@ import torch
 import numpy as np
 import torch.nn.functional as F
 from torch.utils.data.dataset import Dataset
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 import tqdm
 
 def cal_accuracy(output, target, topk=(1,)):
@@ -31,20 +31,21 @@ class NetCLR(object):
         self.batch_size = args['batch_size']
         self.temperature = args['temperature']
         self.out_file = args["out_file"]
+        self.device = args.get("device", next(self.model.parameters()).device)
         self.n_views = 2
-        self.criterion = torch.nn.CrossEntropyLoss().cuda()
+        self.criterion = torch.nn.CrossEntropyLoss().to(self.device)
         self.log_every_n_step = 100
     
     def info_nce_loss(self, features):
         labels = torch.cat([torch.arange(self.batch_size) for i in range(self.n_views)], dim = 0)
         labels = (labels.unsqueeze(0) == labels.unsqueeze(1)).float()
-        labels = labels.cuda()
+        labels = labels.to(self.device)
         
         features = F.normalize(features, dim=1)
         
         similarity_matrix = torch.matmul(features, features.T)
         
-        mask = torch.eye(labels.shape[0], dtype=torch.bool).cuda()
+        mask = torch.eye(labels.shape[0], dtype=torch.bool).to(self.device)
         labels = labels[~mask].view(labels.shape[0], -1)
         similarity_matrix = similarity_matrix[~mask].view(similarity_matrix.shape[0], -1)
         
@@ -55,7 +56,7 @@ class NetCLR(object):
         
         
         logits = torch.cat([positives, negatives], dim=1)
-        labels = torch.zeros(logits.shape[0], dtype=torch.long).cuda()
+        labels = torch.zeros(logits.shape[0], dtype=torch.long).to(self.device)
         
         logits = logits / self.temperature
         return logits, labels
@@ -78,7 +79,7 @@ class NetCLR(object):
                     self.model.train()
                     data = torch.cat(data, dim = 0)
                     data = data.view(data.size(0), 1, data.size(1))
-                    data = data.float().cuda()
+                    data = data.float().to(self.device)
 
                     with autocast(enabled=self.fp16_precision):
                         features = self.model(data)

@@ -1,14 +1,6 @@
 dataset=MultiTab
 model=RF
 
-for filename in bg_train bg_valid bg_tune
-do
-    python -u -m exp.dataset_process.gen_tam \
-        --dataset "" \
-        --seq_len 5000 \
-        --in_file ${filename}
-done
-
 for filename in train valid day14 day30 day90 day150 day270
 do 
     python -u -m exp.dataset_process.gen_tam \

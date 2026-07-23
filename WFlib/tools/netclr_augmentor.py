@@ -5,12 +5,24 @@ import random
 import numpy as np
 import bisect
 
+
+def _first_nonzero_index(x):
+    nonzero_indices = np.flatnonzero(x != 0)
+    if nonzero_indices.size == 0:
+        return None
+    return int(nonzero_indices[0])
+
+
 def find_bursts(x):
-    direction = x[0]
+    first_index = _first_nonzero_index(x)
+    if first_index is None:
+        return []
+
+    direction = x[first_index]
     bursts = []
-    start = 0
-    temp_burst = x[0]
-    for i in range(1, len(x)):
+    start = first_index
+    temp_burst = x[first_index]
+    for i in range(first_index + 1, len(x)):
         if x[i] == 0.0:
             break
         
@@ -65,11 +77,15 @@ class Augmentor:
         Returns:
         list: List of tuples representing bursts (start, end, size).
         """
-        direction = x[0]
+        first_index = _first_nonzero_index(x)
+        if first_index is None:
+            return []
+
+        direction = x[first_index]
         bursts = []
-        start = 0
-        temp_burst = x[0]
-        for i in range(1, len(x)):
+        start = first_index
+        temp_burst = x[first_index]
+        for i in range(first_index + 1, len(x)):
             if x[i] == 0.0:
                 break
             elif x[i] == direction:

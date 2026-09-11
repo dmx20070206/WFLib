@@ -4,7 +4,7 @@ model=TikTok
 python -u exp/train.py \
   --dataset ${dataset} \
   --model ${model} \
-  --device cuda:1 \
+  --device cuda:2 \
   --feature DT \
   --seq_len 5000 \
   --train_epochs 30 \
@@ -24,7 +24,7 @@ do
     python -u exp/test.py \
     --dataset ${dataset} \
     --model ${model} \
-    --device cuda:1 \
+    --device cuda:2 \
     --test_file ${file_name} \
     --feature DT \
     --seq_len 5000 \
@@ -36,7 +36,7 @@ do
     python -u exp/proteus.py \
         --dataset ${dataset} \
         --model ${model} \
-        --device cuda:1 \
+        --device cuda:2 \
         --train_file train \
         --test_file ${file_name} \
         --feature DT \

@@ -8,7 +8,7 @@ from WFlib import models
 from WFlib.tools import data_processor, model_utils
 
 # Set a fixed seed for reproducibility
-fix_seed = 1013
+fix_seed = 2024
 random.seed(fix_seed)
 torch.manual_seed(fix_seed)
 np.random.seed(fix_seed)
@@ -100,14 +100,14 @@ else:
     print("Loading the pretrained model in ", args.load_file)
     checkpoint = torch.load(args.load_file)
 
-    # for k in list(checkpoint.keys()):
-    #     if k.startswith('backbone.'):
-    #         if k.startswith('backbone') and not k.startswith('backbone.fc'):
-    #             checkpoint[k[len("backbone."):]] = checkpoint[k]
-    #     del checkpoint[k]
+    for k in list(checkpoint.keys()):
+        if k.startswith('backbone.'):
+            if k.startswith('backbone') and not k.startswith('backbone.fc'):
+                checkpoint[k[len("backbone."):]] = checkpoint[k]
+        del checkpoint[k]
 
-    model.load_state_dict(checkpoint, strict=False)
-    # assert log.missing_keys == ['fc.weight', 'fc.bias']
+    log = model.load_state_dict(checkpoint, strict=False)
+    assert log.missing_keys == ['fc.weight', 'fc.bias']
 
 model.to(device)
 

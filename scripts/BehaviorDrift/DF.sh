@@ -4,7 +4,7 @@ model=DF
 python -u exp/train.py \
   --dataset ${dataset} \
   --model ${model} \
-  --device cuda:1 \
+  --device cuda:0 \
   --feature DIR \
   --seq_len 5000 \
   --train_epochs 30 \
@@ -24,7 +24,7 @@ do
     python -u exp/test.py \
         --dataset ${dataset} \
         --model ${model} \
-        --device cuda:1 \
+        --device cuda:0 \
         --test_file ${file_name} \
         --feature DIR \
         --seq_len 5000 \
@@ -36,7 +36,7 @@ do
     python -u exp/proteus.py \
         --dataset ${dataset} \
         --model ${model} \
-        --device cuda:1 \
+        --device cuda:0 \
         --train_file train \
         --test_file ${file_name} \
         --feature DIR \

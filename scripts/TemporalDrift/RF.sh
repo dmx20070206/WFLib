@@ -12,7 +12,7 @@ done
 python -u exp/train.py \
   --dataset ${dataset} \
   --model ${model} \
-  --device cuda:5 \
+  --device cuda:2 \
   --train_file tam_train \
   --valid_file tam_valid \
   --feature TAM \
@@ -30,12 +30,12 @@ rm -rf checkpoints/${dataset}/${model}/proteus.pth
 cp checkpoints/${dataset}/${model}/max_f1.pth checkpoints/${dataset}/${model}/proteus.pth
 wait
 
-for file_name in test day14 day30 day90 day150 day270
+for file_name in day270
 do
     python -u exp/test.py \
     --dataset ${dataset} \
     --model ${model} \
-    --device cuda:5 \
+    --device cuda:2 \
     --test_file tam_${file_name} \
     --feature TAM \
     --seq_len 1800 \
@@ -47,7 +47,7 @@ do
     python -u exp/proteus.py \
       --dataset ${dataset} \
       --model ${model} \
-      --device cuda:5 \
+      --device cuda:2 \
       --train_file tam_train \
       --test_file tam_${file_name} \
       --feature TAM \
@@ -58,4 +58,6 @@ do
       --model_save_name proteus \
       --result_file Proteus_${file_name} 
 
+    rm -rf checkpoints/${dataset}/${model}/proteus.pth
+    cp checkpoints/${dataset}/${model}/max_f1.pth checkpoints/${dataset}/${model}/proteus.pth
 done

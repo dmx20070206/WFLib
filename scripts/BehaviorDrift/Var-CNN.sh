@@ -4,7 +4,7 @@ model=VarCNN
 python -u exp/train.py \
   --dataset ${dataset} \
   --model ${model} \
-  --device cuda:4 \
+  --device cuda:3 \
   --feature DT2 \
   --seq_len 5000 \
   --train_epochs 30 \
@@ -24,7 +24,7 @@ do
     python -u exp/test.py \
     --dataset ${dataset} \
     --model ${model} \
-    --device cuda:4 \
+    --device cuda:3 \
     --test_file ${file_name} \
     --feature DT2 \
     --seq_len 5000 \
@@ -36,7 +36,7 @@ do
     python -u exp/proteus.py \
         --dataset ${dataset} \
         --model ${model} \
-        --device cuda:4 \
+        --device cuda:3 \
         --train_file train \
         --test_file ${file_name} \
         --feature DT2 \

@@ -12,7 +12,7 @@ done
 python -u exp/train.py \
   --dataset ${dataset} \
   --model ${model} \
-  --device cuda:6 \
+  --device cuda:1 \
   --train_file tam_train \
   --valid_file tam_valid \
   --feature TAM \
@@ -41,7 +41,7 @@ do
     python -u exp/test.py \
     --dataset ${dataset} \
     --model ${model} \
-    --device cuda:6 \
+    --device cuda:1 \
     --test_file tam_${file_name} \
     --feature TAM \
     --seq_len 1800 \
@@ -53,7 +53,7 @@ do
     python -u exp/proteus.py \
       --dataset ${dataset} \
       --model ${model} \
-      --device cuda:6 \
+      --device cuda:1 \
       --train_file tam_train \
       --test_file tam_${file_name} \
       --feature TAM \

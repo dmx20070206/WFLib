@@ -12,7 +12,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # Set a fixed seed for reproducibility
-fix_seed = 1013
+fix_seed = 2024
 random.seed(fix_seed)
 torch.manual_seed(fix_seed)
 np.random.seed(fix_seed)
@@ -67,11 +67,11 @@ out_file = os.path.join(log_path, f"{args.result_file}.json")
 print(f"loading test file: ", os.path.join(in_path, f"{args.test_file}.npz"))
 valid_X, valid_y = data_processor.load_data(os.path.join(in_path, f"{args.valid_file}.npz"), args.feature, args.seq_len, args.num_tabs)
 test_X, test_y = data_processor.load_data(os.path.join(in_path, f"{args.test_file}.npz"), args.feature, args.seq_len, args.num_tabs)
-num_classes = len(np.unique(test_y))
 
 if args.num_tabs == 1:
-    num_classes = len(np.unique(test_y))
-    assert num_classes == test_y.max() + 1, "Labels are not continuous" # Ensure labels are continuous
+    # Drift test splits can be class subsets, so label ids may be non-contiguous.
+    # Use max label id + 1 to keep model/output dimensionality consistent.
+    num_classes = int(max(valid_y.max(), test_y.max())) + 1
 else:
     num_classes = test_y.shape[1]
 

@@ -98,9 +98,9 @@ class VarCNN(nn.Module):
                 nn.Linear(in_features=1024, out_features=1024),
                 nn.BatchNorm1d(1024),
                 nn.ReLU(inplace=True),
-                nn.Dropout(p=0.5),
-                nn.Linear(in_features=1024, out_features=num_classes)
+                nn.Dropout(p=0.5)
             ])
+        self.mlp = nn.Linear(in_features=1024, out_features=num_classes)
        
     def forward(self, x):
         """
@@ -112,6 +112,7 @@ class VarCNN(nn.Module):
         # Concatenate the outputs of the two encoders
         x = torch.concat((x_dir,x_time), dim=1)
         # Pass through the classifier
-        x = self.classifier(x)
-        return x
+        feat = self.classifier(x)
+        out = self.mlp(feat)
+        return out, feat
 

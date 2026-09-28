@@ -91,9 +91,9 @@ class NetCLR(nn.Module):
         x = self.dropout4(x)
 
                 
-        x = x.view(x.size(0), -1)
-        x = self.fc(x)       
-        return x    
+        feat = x.view(x.size(0), -1)
+        x = self.fc(feat)       
+        return x, feat   
 
 
 class DFsimCLR(nn.Module):
@@ -109,7 +109,8 @@ class DFsimCLR(nn.Module):
             nn.ReLU(),
             nn.Linear(dim_mlp, out_dim)
         )
+
         
     def forward(self, inp):
-        out = self.backbone(inp)
+        out, _ = self.backbone(inp)
         return out

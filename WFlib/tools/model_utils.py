@@ -39,6 +39,7 @@ def knn_monitor(net, device, memory_data_loader, test_data_loader, num_classes, 
         # Use tqdm
         for data, target in tqdm(memory_data_loader, desc="kNN: Building Memory Bank", leave=False):
             feature = net(data.to(device))
+            feature = feature[1] if isinstance(feature, (tuple, list)) else feature
             feature = F.normalize(feature, dim=1)
             feature_bank.append(feature)
             feature_labels.append(target)
@@ -51,6 +52,7 @@ def knn_monitor(net, device, memory_data_loader, test_data_loader, num_classes, 
         for data, target in tqdm(test_data_loader, desc="kNN: Predicting", leave=False):
             data, target = data.to(device), target.to(device)
             feature = net(data)
+            feature = feature[1] if isinstance(feature, (tuple, list)) else feature
             feature = F.normalize(feature, dim=1)
             pred_labels = knn_predict(feature, feature_bank, feature_labels, num_classes, k, t)
             total_num += data.size(0)
@@ -109,6 +111,85 @@ def fast_count_burst(arr):
     
     return adjusted_lengths
 
+
+def _parse_loss_config(loss_name, weights):
+    """Normalize loss names and weights supplied as strings or sequences."""
+    if isinstance(loss_name, str):
+        loss_names = [name.strip() for name in loss_name.split(",") if name.strip()]
+    else:
+        loss_names = [
+            name.strip()
+            for value in loss_name
+            for name in value.split(",")
+            if name.strip()
+        ]
+
+    if not loss_names:
+        raise ValueError("At least one loss function must be specified.")
+
+    if weights is None:
+        loss_weights = [1.0] * len(loss_names)
+    elif isinstance(weights, str):
+        loss_weights = [float(weight.strip()) for weight in weights.split(",") if weight.strip()]
+    else:
+        loss_weights = [float(weight) for weight in weights]
+
+    if len(loss_names) != len(loss_weights):
+        raise ValueError(
+            f"The number of loss functions ({len(loss_names)}) must match "
+            f"the number of weights ({len(loss_weights)})."
+        )
+    return loss_names, loss_weights
+
+
+def _build_loss(loss_name):
+    if loss_name in ["CrossEntropyLoss", "BCEWithLogitsLoss", "MultiLabelSoftMarginLoss"]:
+        return getattr(torch.nn, loss_name)(), None
+    if loss_name == "TripletMarginLoss":
+        criterion = losses.TripletMarginLoss(margin=0.1)
+        miner = miners.TripletMarginMiner(margin=0.1, type_of_triplets="semihard")
+        return criterion, miner
+    if loss_name == "SupConLoss":
+        return losses.SupConLoss(temperature=0.1), None
+    if loss_name == "MultiCrossEntropyLoss":
+        return torch.nn.CrossEntropyLoss(), None
+    raise ValueError(f"Loss function {loss_name} is not matched.")
+
+
+def _compute_loss(loss_name, criterion, miner, logits, features, targets, num_tabs):
+    if loss_name == "TripletMarginLoss":
+        hard_pairs = miner(features, targets)
+        return criterion(features, targets, hard_pairs)
+    if loss_name == "SupConLoss":
+        return criterion(features, targets)
+    if loss_name == "MultiCrossEntropyLoss":
+        target_indices = torch.nonzero(targets, as_tuple=False)[:, 1].view(-1, num_tabs)
+        return sum(
+            criterion(logits[:, tab], target_indices[:, tab])
+            for tab in range(num_tabs)
+        )
+    return criterion(logits, targets)
+
+
+def _classification_mode(loss_names):
+    """Return the prediction rule implied by the configured classification losses."""
+    modes = set()
+    for loss_name in loss_names:
+        if loss_name == "CrossEntropyLoss":
+            modes.add("single_label")
+        elif loss_name in ["BCEWithLogitsLoss", "MultiLabelSoftMarginLoss"]:
+            modes.add("multi_label")
+        elif loss_name == "MultiCrossEntropyLoss":
+            modes.add("multi_cross_entropy")
+
+    if len(modes) > 1:
+        raise ValueError(
+            "Classification losses requiring different validation rules cannot be mixed: "
+            f"{sorted(modes)}."
+        )
+    return next(iter(modes), None)
+
+
 def model_train(
     model,
     optimizer,
@@ -122,19 +203,15 @@ def model_train(
     num_classes,
     num_tabs,
     device,
-    lradj
+    lradj,
+    weights=None,
 ):
-    if loss_name in ["CrossEntropyLoss", "BCEWithLogitsLoss", "MultiLabelSoftMarginLoss"]:
-        criterion = eval(f"torch.nn.{loss_name}")()
-    elif loss_name == "TripletMarginLoss":
-        criterion = losses.TripletMarginLoss(margin=0.1)
-        miner = miners.TripletMarginMiner(margin=0.1, type_of_triplets="semihard")
-    elif loss_name == "SupConLoss":
-        criterion = losses.SupConLoss(temperature=0.1)
-    elif loss_name == "MultiCrossEntropyLoss":
-        criterion = torch.nn.CrossEntropyLoss()
-    else:
-        raise ValueError(f"Loss function {loss_name} is not matched.")
+    loss_names, loss_weights = _parse_loss_config(loss_name, weights)
+    loss_functions = {
+        name: _build_loss(name)
+        for name in loss_names
+    }
+    prediction_mode = _classification_mode(loss_names)
 
     if lradj != "None":
         scheduler = eval(f"torch.optim.lr_scheduler.{lradj}")(optimizer, step_size=30, gamma=0.74)
@@ -154,34 +231,32 @@ def model_train(
             cur_X, cur_y = cur_data[0].to(device), cur_data[1].to(device)
             optimizer.zero_grad()
             raw_outs = model(cur_X)
-            outs = raw_outs[0] if isinstance(raw_outs, (tuple, list)) else raw_outs
+            logits = raw_outs[0] if isinstance(raw_outs, (tuple, list)) else raw_outs
+            features = raw_outs[1] if isinstance(raw_outs, (tuple, list)) else raw_outs
 
-            if loss_name == "TripletMarginLoss":
-                hard_pairs = miner(outs, cur_y)
-                loss = criterion(outs, cur_y, hard_pairs)
-            elif loss_name == "SupConLoss":
-                loss = criterion(outs, cur_y)
-            elif loss_name == "MultiCrossEntropyLoss":
-                loss = 0
-                cur_indices = torch.nonzero(cur_y)
-                cur_indices = cur_indices[:,1].view(-1, num_tabs)
-                for ct in range(num_tabs):
-                    loss_ct = criterion(outs[:, ct], cur_indices[:, ct])
-                    loss = loss + loss_ct
-            else:
-                loss = criterion(outs, cur_y)
+            loss_parts = {}
+            loss = torch.zeros((), device=device)
+            for name, weight in zip(loss_names, loss_weights):
+                criterion, miner = loss_functions[name]
+                current_loss = _compute_loss(
+                    name, criterion, miner, logits, features, cur_y, num_tabs
+                )
+                loss = loss + weight * current_loss
+                loss_parts[name] = current_loss.detach().item()
             
             loss.backward()
             optimizer.step()
-            sum_loss += loss.data.cpu().numpy() * outs.shape[0]
-            sum_count += outs.shape[0]
+            sum_loss += loss.detach().item() * cur_X.shape[0]
+            sum_count += cur_X.shape[0]
             
             # Update progress bar
-            pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
+            progress = {"Loss": f"{loss.item():.4f}"}
+            progress.update({name: f"{value:.4f}" for name, value in loss_parts.items()})
+            pbar.set_postfix(progress)
 
         train_loss = round(sum_loss / sum_count, 3)
 
-        if loss_name in ["TripletMarginLoss", "SupConLoss"]:
+        if prediction_mode is None:
             valid_true, valid_pred = knn_monitor(model, device, train_iter, valid_iter, num_classes, 10)
         else:
             with torch.no_grad():
@@ -197,18 +272,18 @@ def model_train(
                     raw_outs = model(cur_X)
                     outs = raw_outs[0] if isinstance(raw_outs, (tuple, list)) else raw_outs
                     
-                    if loss_name in ["BCEWithLogitsLoss", "MultiLabelSoftMarginLoss"]:
+                    if prediction_mode == "multi_label":
                         cur_pred = torch.sigmoid(outs)
-                    elif loss_name == "CrossEntropyLoss":
+                    elif prediction_mode == "single_label":
                         cur_pred = torch.argsort(outs, dim=1, descending=True)[:,0]
-                    elif loss_name == "MultiCrossEntropyLoss":
+                    elif prediction_mode == "multi_cross_entropy":
                         cur_indices = torch.argmax(outs, dim=-1).cpu()
                         cur_pred = torch.zeros((cur_indices.shape[0], num_classes))
                         for cur_tab in range(cur_indices.shape[1]):
                             row_indices = torch.arange(cur_pred.shape[0])
                             cur_pred[row_indices,cur_indices[:,cur_tab]] += 1
                     else:
-                        raise ValueError(f"Loss function {loss_name} is not matched.")
+                        raise ValueError(f"Prediction mode {prediction_mode} is not matched.")
 
                     valid_pred.append(cur_pred.cpu().numpy())
                     valid_true.append(cur_y.cpu().numpy())

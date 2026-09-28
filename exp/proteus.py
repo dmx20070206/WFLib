@@ -1,403 +1,543 @@
-import os
-import json
-import torch
-import random
+"""Few-shot feature translation adaptation (three-stage protocol)."""
+
+from __future__ import annotations
+
 import argparse
+import json
+import os
+import random
+from typing import Dict, Optional, Sequence, Tuple
+
 import numpy as np
-from WFlib import models
-from sklearn.mixture import GaussianMixture
-from WFlib.tools import data_processor, evaluator
-from torch.utils.data import DataLoader
+import torch
+import torch.nn as nn
 import torch.nn.functional as F
-import warnings
-from tqdm import tqdm
-import math
 
-warnings.filterwarnings("ignore")
-os.environ["PYTHONWARNINGS"] = "ignore"
-
-
-def compute_gaussian_kernel(source, target):
-    sample_count = int(source.size(0)) + int(target.size(0))
-    combined = torch.cat([source, target], dim=0)
-    l2_distance = ((combined.unsqueeze(0) - combined.unsqueeze(1)) ** 2).sum(2)
-    bandwidth = torch.sum(l2_distance) / (sample_count**2 - sample_count)
-    bandwidth = torch.clamp(bandwidth, min=1e-5)
-    return torch.exp(-l2_distance / (bandwidth + 1e-5))
+from WFlib import models
+from WFlib.tools import data_processor, evaluator
+try:
+    # ``python exp/proteus.py`` puts exp/ on sys.path, while
+    # ``python -m exp.proteus`` resolves this as a package import.
+    from log import (configure_logging, log_epoch, log_target_diagnostics,
+                     log_prototype_geometry, log_trainable_parameters, Stage2Metrics)
+except ImportError:  # pragma: no cover - depends on invocation style
+    from exp.log import (configure_logging, log_epoch, log_target_diagnostics,
+                         log_prototype_geometry, log_trainable_parameters, Stage2Metrics)
 
 
-def calculate_mmd_loss(source_features, target_features):
-    batch_size = min(source_features.size(0), target_features.size(0))
-    source_features = source_features[:batch_size]
-    target_features = target_features[:batch_size]
-    kernels = compute_gaussian_kernel(source_features, target_features)
-    xx = kernels[:batch_size, :batch_size]
-    yy = kernels[batch_size:, batch_size:]
-    xy = kernels[:batch_size, batch_size:]
-    yx = kernels[batch_size:, :batch_size]
-    return torch.mean(xx + yy - xy - yx)
+def unpack_output(output):
+    if isinstance(output, (tuple, list)):
+        return output[0], output[1] if len(output) > 1 else output[0]
+    return output, output
 
 
-def compute_softmax_entropy(logits):
-    return -(logits.softmax(1) * logits.log_softmax(1)).sum(1)
+def flatten_features(features):
+    return features.reshape(features.shape[0], -1)
 
 
-def evaluate_model(model, data_loader, metrics, device, desc="Evaluating"):
+def embedding_features(features):
+    """Return the metric-learning representation used by Proteus.
+
+    DMX now returns a pooled 512-D embedding.  L2 normalization makes
+    prototype distances comparable across samples and prevents a few samples
+    with large activation norms from dominating the class mean.
+    """
+    return F.normalize(flatten_features(features), p=2, dim=1, eps=1e-8)
+
+
+def freeze(module):
+    for parameter in module.parameters():
+        parameter.requires_grad_(False)
+
+
+def evaluate_model(model, data_loader, metrics, device):
+    model.eval()
+    predictions, labels = [], []
     with torch.no_grad():
-        model.eval()
-        predictions = []
-        ground_truths = []
-        # Use tqdm for progress bar
-        for batch in tqdm(data_loader, desc="Evaluating", leave=False):
-            inputs, labels = batch[0].to(device), batch[1].to(device)
-            raw_output = model(inputs)
-            if isinstance(raw_output, (tuple, list)):
-                outputs = raw_output[0]
-            else:
-                outputs = raw_output
-            preds = torch.argsort(outputs, dim=1, descending=True)[:, 0]
-            predictions.append(preds.cpu().numpy())
-            ground_truths.append(labels.cpu().numpy())
-        predictions = np.concatenate(predictions)
-        ground_truths = np.concatenate(ground_truths)
-    return evaluator.measurement(ground_truths, predictions, metrics)
+        for inputs, batch_labels in data_loader:
+            logits, _ = unpack_output(model(inputs.to(device)))
+            predictions.append(logits.argmax(1).cpu().numpy())
+            labels.append(batch_labels.cpu().numpy())
+    if not predictions:
+        return {metric: float("nan") for metric in metrics}
+    return evaluator.measurement(
+        np.concatenate(labels), np.concatenate(predictions), metrics
+    )
 
 
-def compute_gmm_probabilities(model, data_loader, device):
-    entropies = []
-    predictions = []
-    with torch.no_grad():
-        model.eval()
-        for batch in data_loader:
-            inputs, _ = batch[0].to(device), batch[1].to(device)
-            raw_output = model(inputs)
-            outputs = raw_output[0] if isinstance(raw_output, (tuple, list)) else raw_output
-            preds = torch.argsort(outputs, dim=1, descending=True)[:, 0]
-            entropies.append(compute_softmax_entropy(outputs).cpu().numpy())
-            predictions.append(preds.cpu().numpy())
-    entropies = np.concatenate(entropies).flatten()
-    predictions = np.concatenate(predictions).flatten()
-    entropies = (entropies - entropies.min()) / (entropies.max() - entropies.min())
-    entropies = entropies.reshape(-1, 1)
-    predictions = torch.tensor(predictions, dtype=torch.int64)
-    gmm = GaussianMixture(n_components=2, tol=1e-6)
-    gmm.fit(entropies)
-    probabilities = gmm.predict_proba(entropies)
-    low_uncertainty_index = np.argmin(gmm.means_.flatten())
-    return probabilities[:, low_uncertainty_index], predictions
+
+def load_checkpoint(path):
+    """Load a state dict without the pickle warning on recent PyTorch."""
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:  # PyTorch < 2.0 has no weights_only argument.
+        return torch.load(path, map_location="cpu")
 
 
-def create_pseudo_labels(clean_probs, inputs, labels, threshold, batch_size, num_workers):
-    clean_indices = clean_probs >= threshold
-    pseudo_inputs = inputs[clean_indices]
-    pseudo_labels = labels[clean_indices]
-    return data_processor.load_iter(pseudo_inputs, pseudo_labels, batch_size, True, num_workers)
+def select_support_indices(labels, shot, seed=2024):
+    if shot < 1:
+        raise ValueError("shot must be at least 1")
+    labels_np = labels.detach().cpu().numpy()
+    rng = np.random.default_rng(seed)
+    support = []
+    for label in np.unique(labels_np):
+        candidates = np.flatnonzero(labels_np == label)
+        rng.shuffle(candidates)
+        support.extend(candidates[:shot].tolist())
+    support = np.asarray(sorted(support), dtype=np.int64)
+    all_indices = np.arange(labels_np.shape[0])
+    mask = np.ones(labels_np.shape[0], dtype=bool)
+    mask[support] = False
+    return support, all_indices[mask]
 
 
-def adapt_model(
-    model,
-    adapt_data,
-    adapt_labels,
-    adapt_data_loader,
-    pseudo_eval_loader,
-    origin_data_loader,
-    test_data_loader,
-    metrics,
-    device,
-    threshold,
+@torch.no_grad()
+def compute_target_prototypes(target_encoder, support_loader, num_classes, device):
+    target_encoder.eval()
+    vectors = [[] for _ in range(num_classes)]
+    for inputs, labels in support_loader:
+        _, features = unpack_output(target_encoder(inputs.to(device)))
+        for feature, label in zip(embedding_features(features), labels.tolist()):
+            if 0 <= int(label) < num_classes:
+                vectors[int(label)].append(feature)
+    if any(not values for values in vectors):
+        missing = [str(i) for i, values in enumerate(vectors) if not values]
+        raise ValueError(
+            "support set has no example for class(es): " + ", ".join(missing)
+        )
+    prototypes = torch.stack([torch.stack(values).mean(0) for values in vectors])
+    return F.normalize(prototypes, p=2, dim=1, eps=1e-8)
+
+
+class FeatureTranslator(nn.Module):
+    """2-3 layer MLP used as the asymmetric source-to-target mapper."""
+
+    def __init__(self, feature_dim, hidden_dim=None, layers=2):
+        super().__init__()
+        if layers not in (2, 3):
+            raise ValueError("translator layers must be 2 or 3")
+        hidden_dim = hidden_dim or max(128, min(1024, feature_dim))
+        blocks = [nn.Linear(feature_dim, hidden_dim), nn.GELU()]
+        if layers == 3:
+            blocks.extend([nn.Linear(hidden_dim, hidden_dim), nn.GELU()])
+        blocks.append(nn.Linear(hidden_dim, feature_dim))
+        self.network = nn.Sequential(*blocks)
+
+    def forward(self, features):
+        return F.normalize(self.network(flatten_features(features)), p=2, dim=1, eps=1e-8)
+
+
+def attractive_alignment_loss(translated, prototypes, labels):
+    """Pull each translated source feature to its target-class prototype."""
+    return (translated - prototypes[labels]).pow(2).sum(1).mean()
+
+
+def repulsive_contrast_loss(translated, prototypes, labels, alpha=1.0):
+    """Keep translated features at least ``alpha`` away from other classes."""
+    distances = torch.cdist(translated, prototypes)
+    other = torch.ones_like(distances, dtype=torch.bool)
+    other[torch.arange(distances.shape[0], device=distances.device), labels] = False
+    return (
+        F.relu(alpha - distances[other]).mean()
+        if other.any()
+        else translated.new_zeros(())
+    )
+
+
+def translator_loss(translated, prototypes, labels, alpha=1.0, lambda_contrast=1.0):
+    """Return ``L_align + lambda * L_contrast`` from the report."""
+    align = attractive_alignment_loss(translated, prototypes, labels)
+    contrast = repulsive_contrast_loss(translated, prototypes, labels, alpha)
+    return align + lambda_contrast * contrast, align, contrast
+
+
+def train_epoch_target(
+    target_encoder, support_loader, device, optimizer,
 ):
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    adapt_true_labels = adapt_labels
-    origin_data_iter = iter(origin_data_loader)
-    loss_function = torch.nn.CrossEntropyLoss()
-    best_f1_score, best_f1_score_epoch, best_accuracy, best_accuracy_epoch = 0, 0, 0, 0
-    pseudo_loader = None
-    for epoch in range(100):
-        if epoch % 5 == 0:
-            # Recompute pseudo-labels every 5 epochs
-            clean_probs, pseudo_labels = compute_gmm_probabilities(model, pseudo_eval_loader, device)
-            summarize_pseudo_label_quality(
-                clean_probs=clean_probs,
-                pseudo_preds=pseudo_labels,
-                true_labels=adapt_true_labels,
-                threshold=threshold,
-                epoch=epoch,
-            )
-            # Create new pseudo-label data loader
-            pseudo_loader = create_pseudo_labels(
-                clean_probs,
-                adapt_data,
-                pseudo_labels,
-                threshold,
-                args.batch_size,
-                args.num_workers,
-            )
-            pseudo_data_iter = iter(pseudo_loader)
-        model.train()
-        # origin_loss: classification loss on original labeled data
-        # mmd_loss: MMD loss between origin and adapt features
-        # entropy_loss: entropy loss on adapt data
-        # pseudo_loss: classification loss on pseudo-labeled data
-        origin_loss_sum, mmd_loss_sum, entropy_loss_sum, pseudo_loss_sum, total_samples = 0, 0, 0, 0, 0
+    """Stage 1: fine-tune only on target support set (no source CE drift)."""
+    target_encoder.train()
+    criterion = nn.CrossEntropyLoss()
+    sums = {"loss": 0.0}
+    count = 0
+    for support_inputs, support_labels in support_loader:
+        support_inputs, support_labels = (
+            support_inputs.to(device),
+            support_labels.to(device).long(),
+        )
+        optimizer.zero_grad()
+        logits, _ = unpack_output(target_encoder(support_inputs))
+        loss = criterion(logits, support_labels)
+        loss.backward()
+        optimizer.step()
+        n = support_inputs.shape[0]
+        count += n
+        sums["loss"] += float(loss.detach()) * n
+    return {name: value / max(count, 1) for name, value in sums.items()}
 
-        # Use tqdm for training loop
-        pbar = tqdm(adapt_data_loader, desc=f"Epoch {epoch+1}/100", leave=False)
 
-        for adapt_batch in pbar:
+def train_translator(
+    translator,
+    feature_encoder,  # same encoder used to extract source features & compute prototypes
+    source_loader,
+    prototypes,
+    device,
+    epochs=20,
+    lr=1e-3,
+    alpha=1.0,
+    contrast_weight=1.0,
+):
+    """Stage 2: L_align + lambda * L_contrast; only T is updated."""
+    feature_encoder.eval()
+    freeze(feature_encoder)
+    translator.to(device)
+    prototypes = prototypes.to(device)
+    optimizer = torch.optim.Adam(translator.parameters(), lr=lr)
+    for epoch in range(epochs):
+        translator.train()
+        metrics = Stage2Metrics()
+        for inputs, labels in source_loader:
+            with torch.no_grad():
+                source_features = embedding_features(
+                    unpack_output(feature_encoder(inputs.to(device)))[1]
+                )
+            labels = labels.to(device).long()
+            valid = (labels >= 0) & (labels < prototypes.shape[0])
+            if not valid.any():
+                continue
+            translated = translator(source_features[valid])
+            chosen_labels = labels[valid]
+            loss, align_loss, contrast_loss = translator_loss(
+                translated, prototypes, chosen_labels, alpha, contrast_weight
+            )
+            optimizer.zero_grad()
+            metrics.measure_gradient_conflict(
+                align_loss, contrast_loss, translator, contrast_weight,
+            )
+            loss.backward()
+            metrics.update(
+                translated, prototypes, chosen_labels, translator, alpha,
+                loss=loss, align=align_loss, contrast=contrast_loss,
+            )
+            optimizer.step()
+        metrics.log_epoch(epoch + 1, epochs)
+    return translator
+
+
+def train_stage3(
+    target_encoder,
+    translator,
+    source_loader,
+    support_loader,
+    device,
+    epochs,
+    lr,
+    target_loss_weight=1.0,
+    augmented_loss_weight=1.0,
+    max_pseudo=0,
+    eval_loader=None,
+    eval_device=None,
+    source_loss_weight=0.0,
+):
+    """Stage 3: train on target support (full forward) + raw source (full forward)
+    + translated features (via logits_from_embedding for head only).
+
+    All feature extraction uses the *same* target_encoder (frozen at Stage 3 start),
+    so the translator's input space matches Stage 2's learned mapping.
+    """
+    freeze(translator)
+    translator.eval()
+    target_encoder.to(device)
+    # Stage 2 froze this same object; train()/to() do not undo that freeze.
+    target_encoder.requires_grad_(True)
+    log_trainable_parameters(target_encoder, translator)
+    optimizer = torch.optim.Adam(target_encoder.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss()
+
+    # Pre-compute translated features using the current target_encoder's embedding space
+    target_encoder.eval()  # temporarily eval for feature extraction
+    augmented_features, augmented_labels = [], []
+    seen = 0
+    with torch.no_grad():
+        for inputs, labels in source_loader:
+            if max_pseudo > 0 and seen >= max_pseudo:
+                break
+            features = embedding_features(
+                unpack_output(target_encoder(inputs.to(device)))[1]
+            )
+            translated = translator(features).cpu()
+            labels = labels.long().cpu()
+            if max_pseudo > 0:
+                take = min(translated.shape[0], max_pseudo - seen)
+                translated, labels = translated[:take], labels[:take]
+            augmented_features.append(translated)
+            augmented_labels.append(labels)
+            seen += translated.shape[0]
+    if not augmented_features:
+        raise ValueError("Stage 3 received no source samples for augmentation")
+    augmented_x = torch.cat(augmented_features)
+    augmented_y = torch.cat(augmented_labels)
+    augmented_loader = data_processor.load_iter(
+        augmented_x, augmented_y, batch_size=min(256, len(augmented_y)),
+        is_train=False, num_workers=0
+    )
+    target_encoder.train()
+
+    source_iter = iter(source_loader)
+
+    for epoch in range(epochs):
+        target_encoder.train()
+        support_iter = iter(support_loader)
+        sums = {"loss": 0.0, "augmented": 0.0, "target": 0.0, "source_raw": 0.0}
+        count = 0
+        for augmented_batch, augmented_labels_batch in augmented_loader:
+            # --- Target support (full forward) ---
             try:
-                origin_batch = next(origin_data_iter)
+                support_inputs, support_labels = next(support_iter)
             except StopIteration:
-                origin_data_iter = iter(origin_data_loader)
-                origin_batch = next(origin_data_iter)
-            pseudo_batch = None
-            if pseudo_loader is not None and len(pseudo_loader) > 0:
-                try:
-                    pseudo_batch = next(pseudo_data_iter)
-                except StopIteration:
-                    pseudo_data_iter = iter(pseudo_loader)
-                    pseudo_batch = next(pseudo_data_iter)
+                support_iter = iter(support_loader)
+                support_inputs, support_labels = next(support_iter)
+            support_inputs = support_inputs.to(device)
+            support_labels = support_labels.to(device).long()
 
-            # X,  y (labeled)
-            origin_inputs, origin_labels = origin_batch[0].to(device), origin_batch[1].to(device)
-            # X', _ (no labels)
-            adapt_inputs, _adapt_batch_labels = adapt_batch[0].to(device), adapt_batch[1].to(device)
-            # X', y'(pseudo)
-            pseudo_inputs, pseudo_batch_labels = (
-                (pseudo_batch[0].to(device), pseudo_batch[1].to(device)) if pseudo_batch is not None else (None, None)
-            )
+            # --- Raw source (full forward) ---
+            try:
+                src_inputs, src_labels = next(source_iter)
+            except StopIteration:
+                source_iter = iter(source_loader)
+                src_inputs, src_labels = next(source_iter)
+            src_inputs, src_labels = src_inputs.to(device), src_labels.to(device).long()
 
             optimizer.zero_grad()
-            # Forward pass
-            # X -> outputs, features
-            unpack = lambda x: x if isinstance(x, (tuple, list)) else (x, x)
-            origin_outputs, origin_features = unpack(model(origin_inputs))
-            adapt_outputs, adapt_features = unpack(model(adapt_inputs))
-            pseudo_outputs, pseudo_features = (
-                unpack(model(pseudo_inputs)) if pseudo_inputs is not None else (None, None)
+
+            # Target support: full forward → backbone + head updated
+            target_logits, _ = unpack_output(target_encoder(support_inputs))
+            target_loss = criterion(target_logits, support_labels)
+
+            # Raw source: full forward → backbone + head updated
+            source_logits, _ = unpack_output(target_encoder(src_inputs))
+            source_raw_loss = criterion(source_logits, src_labels)
+
+            # Translated features: head only (via logits_from_embedding)
+            augmented_batch = augmented_batch.to(device)
+            augmented_labels_batch = augmented_labels_batch.to(device).long()
+            augmented_logits = target_encoder.logits_from_embedding(augmented_batch)
+            augmented_loss = criterion(augmented_logits, augmented_labels_batch)
+
+            total = (
+                augmented_loss_weight * augmented_loss
+                + target_loss_weight * target_loss
+                + source_loss_weight * source_raw_loss
             )
-
-            softmax_out = F.softmax(adapt_outputs, dim=-1)
-            mean_softmax = softmax_out.mean(dim=0)
-
-            # origin_loss
-            classification_loss = loss_function(origin_outputs, origin_labels)
-            # pseudo_loss
-            pseudo_loss = (
-                loss_function(pseudo_outputs, pseudo_batch_labels)
-                if pseudo_outputs is not None
-                else torch.tensor(0.0, device=device)
-            )
-            # entropy_loss
-            entropy_loss = compute_softmax_entropy(adapt_outputs).mean(0) + torch.sum(
-                mean_softmax * torch.log(mean_softmax + 1e-5)
-            )
-            # mmd_loss
-            mmd_loss = calculate_mmd_loss(origin_features, adapt_features)
-
-            lambd = 2 / (1 + math.exp(-10 * (epoch) / 100)) - 1
-
-            # Total loss = origin_loss + pseudo_loss + entropy_loss + mmd_loss
-            total_loss = classification_loss + pseudo_loss + entropy_loss + mmd_loss
-
-            total_loss.backward()
+            total.backward()
             optimizer.step()
 
-            # Accumulate losses
-            origin_loss_sum += classification_loss.data.cpu().numpy() * origin_outputs.shape[0]
-            mmd_loss_sum += mmd_loss.data.cpu().numpy() * origin_outputs.shape[0]
-            entropy_loss_sum += entropy_loss.data.cpu().numpy() * origin_outputs.shape[0]
-            pseudo_loss_sum += pseudo_loss.data.cpu().numpy() * origin_outputs.shape[0]
-            total_samples += adapt_outputs.shape[0]
+            n = int(augmented_batch.shape[0])
+            count += n
+            sums["loss"] += float(total.detach()) * n
+            sums["augmented"] += float(augmented_loss.detach()) * n
+            sums["target"] += float(target_loss.detach()) * n
+            sums["source_raw"] += float(source_raw_loss.detach()) * n
 
-            # Update progress bar description with current loss
-            pbar.set_postfix({"Loss": f"{total_loss.item():.4f}"})
-
-        # evaluate after each epoch
-        epoch_result = evaluate_model(model, test_data_loader, metrics, device, desc="Validating")
-
-        # Format output for better readability
-        res_str = ", ".join([f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}" for k, v in epoch_result.items()])
-        print(f"Epoch {epoch+1:03d} | {res_str}")
-
-        if epoch_result["F1-score"] > best_f1_score:
-            best_f1_score = epoch_result["F1-score"]
-            best_f1_score_epoch = epoch
-        if "Accuracy" in epoch_result and epoch_result["Accuracy"] > best_accuracy:
-            best_accuracy = epoch_result["Accuracy"]
-            best_accuracy_epoch = epoch
-
-    print(f"{'='*20} Adaptation Finished {'='*20}\n")
-    return best_f1_score, best_f1_score_epoch, best_accuracy, best_accuracy_epoch
+        values = {name: value / max(count, 1) for name, value in sums.items()}
+        accuracy = None
+        if eval_loader is not None:
+            accuracy = evaluate_model(
+                target_encoder, eval_loader, ["Accuracy"], eval_device or device,
+            )["Accuracy"]
+        log_epoch(3, epoch + 1, epochs, values, accuracy, acc_scope="target evaluation")
 
 
-# Argument parsing and setup omitted for brevity
-fix_seed = 2024
-random.seed(fix_seed)
-torch.manual_seed(fix_seed)
-np.random.seed(fix_seed)
-
-# Command-line arguments
-parser = argparse.ArgumentParser(description="WFlib")
-parser.add_argument("--dataset", type=str, required=True, default="CW", help="Dataset name")
-parser.add_argument("--model", type=str, required=True, default="DF", help="Model name")
-parser.add_argument("--device", type=str, default="cpu", help="Device, options=[cpu, cuda, cuda:x]")
-parser.add_argument("--num_tabs", type=int, default=1, help="Maximum number of tabs opened by users while browsing")
-parser.add_argument(
-    "--scenario", type=str, default="Closed-world", help="Attack scenario, options=[Closed-world, Open-world]"
-)
-
-# Input parameters
-parser.add_argument("--train_file", type=str, default="train", help="Train file")
-parser.add_argument("--test_file", type=str, default="test", help="Test file")
-parser.add_argument("--feature", type=str, default="DIR", help="Feature type, options=[DIR, DT, DT2, TAM, TAF]")
-parser.add_argument("--seq_len", type=int, default=5000, help="Input sequence length")
-
-# Optimization parameters
-parser.add_argument("--num_workers", type=int, default=10, help="Data loader num workers")
-parser.add_argument("--batch_size", type=int, default=256, help="Batch size of train input data")
-
-# Output parameters
-parser.add_argument(
-    "--eval_method", type=str, default="common", help="Method used in the evaluation, options=[common, kNN, holmes]"
-)
-parser.add_argument(
-    "--eval_metrics",
-    nargs="+",
-    required=True,
-    type=str,
-    help="Evaluation metrics, options=[Accuracy, Precision, Recall, F1-score, P@min, r-Precision]",
-)
-parser.add_argument("--log_path", type=str, default="./logs/", help="Log path")
-parser.add_argument("--checkpoints", type=str, default="./checkpoints/", help="Location of model checkpoints")
-parser.add_argument("--load_name", type=str, default="base", help="Name of the model file")
-parser.add_argument("--result_file", type=str, default="result", help="File to save test results")
-parser.add_argument("--gmm_threshold", type=float, default=0.6, help="GMM threshold")
-parser.add_argument("--model_save_name", type=str, default="proteus", help="Name used to save the model")
-parser.add_argument("--limit_n", type=int, default=5, help="Limit number of samples for fine-tuning")
-
-# Parse arguments
-args = parser.parse_args()
-
-# Ensure the specified device is available, fallback to available device if not
-if args.device.startswith("cuda") and not torch.cuda.is_available():
-    device = torch.device("cpu")
-else:
-    device = torch.device(args.device)
-
-# Define paths for dataset, logs, and checkpoints
-dataset_path = os.path.join("./datasets", args.dataset)
-if not os.path.exists(dataset_path):
-    raise FileNotFoundError(f"The dataset path does not exist: {dataset_path}")
-log_path = os.path.join(args.log_path, args.dataset, args.model)
-ckp_path = os.path.join(args.checkpoints, args.dataset, args.model)
-os.makedirs(log_path, exist_ok=True)
-output_file = os.path.join(log_path, f"{args.result_file}.json")
-
-# Load training and validation data
-print(f"\n{'='*20} Configuration {'='*20}")
-print(f"Dataset: {args.dataset}")
-print(f"Model: {args.model}")
-print(f"Device: {device}")
-print(f"Test File: {os.path.join(dataset_path, f'{args.test_file}.npz')}")
-
-train_data, train_labels = data_processor.load_data(
-    os.path.join(dataset_path, f"{args.train_file}.npz"), args.feature, args.seq_len, args.num_tabs
-)
-test_data, test_labels = data_processor.load_data(
-    os.path.join(dataset_path, f"{args.test_file}.npz"), args.feature, args.seq_len, args.num_tabs
-)
-adapt_data, adapt_labels = test_data, test_labels
-
-if args.num_tabs == 1:
-    num_classes = len(np.unique(test_labels))
-    assert num_classes == test_labels.max() + 1, "Labels are not continuous"
-else:
-    num_classes = test_labels.shape[1]
-
-if args.limit_n > 0:
-    print(f"Truncating adaptation data to {args.limit_n} samples per class...")
-    indices = []
-    labels_np = test_labels.cpu().numpy() if isinstance(test_labels, torch.Tensor) else test_labels
-    unique_labels = np.unique(labels_np)
-
-    for label in unique_labels:
-        label_indices = np.where(labels_np == label)[0]
-        if len(label_indices) > args.limit_n:
-            label_indices = label_indices[: args.limit_n]
-        indices.extend(label_indices)
-
-    indices = sorted(indices)
-    adapt_data = test_data[indices]
-    adapt_labels = test_labels[indices]
-    print(f"Truncated adaptation data. Total samples: {len(adapt_labels)}")
+def build_model(model_name, num_classes, num_tabs):
+    return (
+        getattr(models, model_name)(num_classes, num_tabs)
+        if model_name in ("BAPM", "TMWF")
+        else getattr(models, model_name)(num_classes)
+    )
 
 
-# Print dataset information
-print(f"Train data shape: X={train_data.shape}, y={train_labels.shape}")
-print(f"Adapt data shape: X={adapt_data.shape}, y={adapt_labels.shape}")
-print(f"Test data shape: X={test_data.shape}, y={test_labels.shape}")
-print(f"Number of classes: {num_classes}")
-print(f"{'='*55}\n")
+def make_parser():
+    parser = argparse.ArgumentParser(
+        description="Few-shot feature translation adaptation"
+    )
+    parser.add_argument("--dataset", required=True, default="CW")
+    parser.add_argument("--model", required=True, default="DF")
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--num_tabs", type=int, default=1)
+    parser.add_argument("--train_file", default="train")
+    parser.add_argument("--test_file", default="test")
+    parser.add_argument("--feature", default="DIR")
+    parser.add_argument("--seq_len", type=int, default=5000)
+    parser.add_argument("--num_workers", type=int, default=10)
+    parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--eval_method", default="common")
+    parser.add_argument(
+        "--eval_metrics", nargs="+", default=["Accuracy"],
+        help="Deprecated compatibility option; evaluation always reports Accuracy only",
+    )
+    parser.add_argument("--log_path", default="./logs/")
+    parser.add_argument("--checkpoints", default="./checkpoints/")
+    parser.add_argument("--load_name", default="base")
+    parser.add_argument("--result_file", default="result")
+    parser.add_argument("--model_save_name", default="fewshot")
+    parser.add_argument("--shot", type=int, default=5)
+    parser.add_argument("--support_seed", type=int, default=20070206)
+    parser.add_argument("--stage1_epochs", type=int, default=50)
+    parser.add_argument("--stage2_epochs", type=int, default=100)
+    parser.add_argument("--stage3_epochs", type=int, default=50)
+    parser.add_argument("--adapt_lr", type=float, default=1e-4)
+    parser.add_argument("--map_lr", type=float, default=1e-3)
+    parser.add_argument("--map_hidden", type=int, default=0)
+    parser.add_argument("--map_layers", type=int, default=2, choices=(2, 3))
+    parser.add_argument("--alpha", type=float, default=1.0)
+    parser.add_argument("--lambda_contrast", type=float, default=1.0)
+    parser.add_argument("--target_loss_weight", type=float, default=1.0)
+    parser.add_argument("--augmented_loss_weight", type=float, default=1.0)
+    parser.add_argument("--source_raw_weight", type=float, default=0.0,
+                      help="Weight for raw source CE (full forward) in Stage 3")
+    parser.add_argument("--max_pseudo", type=int, default=0)
+    parser.add_argument(
+        "--enable_log",
+        action="store_true",
+        help="Write additional target prototype diagnostics to the log file",
+    )
+    return parser
 
-# Load data into iterators
-origin_data_loader = data_processor.load_iter(train_data, train_labels, args.batch_size, True, args.num_workers)
 
-adapt_data_loader = data_processor.load_iter(
-    adapt_data, torch.zeros_like(adapt_labels), args.batch_size, True, args.num_workers
-)
+def main(argv: Optional[Sequence[str]] = None):
+    args = make_parser().parse_args(argv)
+    random.seed(2024)
+    np.random.seed(2024)
+    torch.manual_seed(2024)
+    device = torch.device(
+        "cpu"
+        if args.device.startswith("cuda") and not torch.cuda.is_available()
+        else args.device
+    )
+    dataset_path = os.path.join("./datasets", args.dataset)
+    if not os.path.isdir(dataset_path):
+        raise FileNotFoundError(f"The dataset path does not exist: {dataset_path}")
+    log_path = os.path.join(args.log_path, args.dataset, args.model)
+    checkpoint_path = os.path.join(args.checkpoints, args.dataset, args.model)
+    os.makedirs(log_path, exist_ok=True)
+    os.makedirs(checkpoint_path, exist_ok=True)
+    configure_logging(os.path.join(log_path, f"{args.result_file}.log"), vars(args), device)
+    source_data, source_labels = data_processor.load_data(
+        os.path.join(dataset_path, f"{args.train_file}.npz"),
+        args.feature,
+        args.seq_len,
+        args.num_tabs,
+    )
+    target_data, target_labels = data_processor.load_data(
+        os.path.join(dataset_path, f"{args.test_file}.npz"),
+        args.feature,
+        args.seq_len,
+        args.num_tabs,
+    )
+    if args.num_tabs != 1:
+        raise ValueError(
+            "Few-shot adaptation requires integer single-class labels (--num_tabs 1)"
+        )
+    num_classes = int(torch.unique(target_labels).numel())
+    if int(target_labels.max()) + 1 != num_classes:
+        raise ValueError("target labels must be contiguous integers starting at 0")
+    shot = args.shot
+    support_indices, eval_indices = select_support_indices(
+        target_labels, shot, args.support_seed
+    )
+    if len(eval_indices) == 0:
+        raise ValueError("target set must contain samples outside support set")
+    support_data, support_labels = (
+        target_data[support_indices],
+        target_labels[support_indices],
+    )
+    eval_data, eval_labels = target_data[eval_indices], target_labels[eval_indices]
+    # Keep the final partial source batch; dropping it can make a small
+    # few-shot smoke test (or a small dataset) produce an empty loader.
+    source_loader = data_processor.load_iter(
+        source_data, source_labels, args.batch_size, True, args.num_workers
+    )
+    # Never drop the support set: with 1-shot data it is normally smaller than
+    # the training batch size.  Shuffling is unnecessary because the support
+    # set was sampled with a deterministic seed above.
+    support_loader = data_processor.load_iter(
+        support_data, support_labels, args.batch_size, True, args.num_workers
+    )
+    eval_loader = data_processor.load_iter(
+        eval_data, eval_labels, args.batch_size, False, args.num_workers
+    )
+    target_encoder = build_model(args.model, num_classes, args.num_tabs)
+    target_encoder.load_state_dict(
+        load_checkpoint(os.path.join(checkpoint_path, f"{args.load_name}.pth"))
+    )
+    target_encoder.to(device)
+    optimizer = torch.optim.Adam(target_encoder.parameters(), lr=args.adapt_lr)
+    with torch.no_grad():
+        feature_dim = embedding_features(
+            unpack_output(target_encoder(next(iter(source_loader))[0].to(device)))[1]
+        ).shape[1]
+    for epoch in range(args.stage1_epochs):
+        losses = train_epoch_target(
+            target_encoder, support_loader, device, optimizer,
+        )
+        accuracy = evaluate_model(target_encoder, eval_loader, ["Accuracy"], device)
+        log_epoch(1, epoch + 1, args.stage1_epochs, losses,
+                  accuracy["Accuracy"], acc_scope="target evaluation")
+    prototypes = compute_target_prototypes(
+        target_encoder, support_loader, num_classes, device
+    )
+    log_prototype_geometry(prototypes, source_labels, args.alpha, args.lambda_contrast)
+    if args.enable_log:
+        log_target_diagnostics(target_encoder, support_loader, eval_loader,
+                               prototypes, device, prefix="After Stage 1 / Before Stage 2")
+    translator = FeatureTranslator(
+        feature_dim, args.map_hidden or None, args.map_layers
+    )
+    train_translator(
+        translator,
+        target_encoder,
+        source_loader,
+        prototypes,
+        device,
+        args.stage2_epochs,
+        args.map_lr,
+        args.alpha,
+        args.lambda_contrast,
+    )
+    train_stage3(
+        target_encoder,
+        translator,
+        source_loader,
+        support_loader,
+        device,
+        args.stage3_epochs,
+        args.adapt_lr,
+        args.target_loss_weight,
+        args.augmented_loss_weight,
+        args.max_pseudo,
+        eval_loader,
+        device,
+        source_loss_weight=args.source_raw_weight,
+    )
+    if args.enable_log:
+        # Recompute prototypes because Stage 1/3 may have changed the target
+        # encoder.  This makes the before/after diagnostics comparable.
+        adapted_prototypes = compute_target_prototypes(
+            target_encoder, support_loader, num_classes, device
+        )
+        log_target_diagnostics(target_encoder, support_loader, eval_loader,
+                               adapted_prototypes, device, prefix="After Stage 3")
+    result = evaluate_model(target_encoder, eval_loader, ["Accuracy"], device)
+    log_epoch("Final", None, None, {}, result["Accuracy"], acc_scope="target evaluation")
+    torch.save(
+        target_encoder.state_dict(),
+        os.path.join(checkpoint_path, f"{args.model_save_name}.pth"),
+    )
+    with open(
+        os.path.join(log_path, f"{args.result_file}.json"), "w", encoding="utf-8"
+    ) as handle:
+        json.dump(result, handle, indent=2)
+    return result
 
-pseudo_eval_loader = data_processor.load_iter(
-    adapt_data, torch.zeros_like(adapt_labels), args.batch_size, False, args.num_workers
-)
 
-test_data_loader = data_processor.load_iter(test_data, test_labels, args.batch_size, False, args.num_workers)
-
-# Initialize model, optimizer, and loss function
-if args.model in ["BAPM", "TMWF"]:
-    model = eval(f"models.{args.model}")(num_classes, args.num_tabs)
-else:
-    model = eval(f"models.{args.model}")(num_classes)
-
-model.load_state_dict(torch.load(os.path.join(ckp_path, f"{args.load_name}.pth"), map_location="cpu"))
-model.to(device)
-
-# Evaluation before adaptation
-print(f"{'='*20} Initial Evaluation {'='*20}")
-initial_result = evaluate_model(model, test_data_loader, args.eval_metrics, device, desc="Initial Eval")
-res_str = ", ".join([f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}" for k, v in initial_result.items()])
-print(f"Result: {res_str}")
-print(f"{'='*60}\n")
-
-# Model adaptation
-best_f1_score, best_f1_score_epoch, best_accuracy, best_accuracy_epoch = adapt_model(
-    model,
-    adapt_data,
-    adapt_labels,
-    adapt_data_loader,
-    pseudo_eval_loader,
-    origin_data_loader,
-    test_data_loader,
-    args.eval_metrics,
-    device,
-    args.gmm_threshold,
-)
-
-# Evaluation after adaptation
-print(f"{'='*20} Final Evaluation {'='*20}")
-final_result = evaluate_model(model, test_data_loader, args.eval_metrics, device, desc="Final Eval")
-final_result["best_f1_score"] = best_f1_score
-final_result["best_f1_epoch"] = best_f1_score_epoch
-final_result["best_accuracy"] = best_accuracy
-final_result["best_accuracy_epoch"] = best_accuracy_epoch
-
-res_str = ", ".join([f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}" for k, v in final_result.items()])
-print(f"Result: {res_str}")
-print(f"{'='*58}\n")
-
-# Save model
-model_save_path = os.path.join(ckp_path, f"{args.model_save_name}.pth")
-torch.save(model.state_dict(), model_save_path)
-
-# Save results to file
-with open(output_file, "w") as result_file:
-    json.dump(final_result, result_file, indent=4)
+if __name__ == "__main__":
+    main()

@@ -12,6 +12,39 @@ import warnings
 warnings.filterwarnings("ignore")
 os.environ["PYTHONWARNINGS"] = "ignore"
 
+
+class JSDivergence(torch.nn.Module):
+    """Jensen-Shannon divergence between two categorical distributions.
+
+    Inputs may be probabilities or logits (set ``logits=True``).  The two
+    distributions can be passed as ``(p, q)`` or as a tensor shaped
+    ``(..., 2, classes)``.
+    """
+
+    def __init__(self, logits=True, reduction="mean", eps=1e-8):
+        super().__init__()
+        self.logits = logits
+        self.reduction = reduction
+        self.eps = eps
+
+    def forward(self, p, q=None):
+        if q is None:
+            if not isinstance(p, (tuple, list)) or len(p) != 2:
+                raise ValueError("JSDivergence expects two distributions (p, q).")
+            p, q = p
+        if self.logits:
+            p, q = F.softmax(p, dim=-1), F.softmax(q, dim=-1)
+        p = p.clamp_min(self.eps)
+        q = q.clamp_min(self.eps)
+        m = 0.5 * (p + q)
+        js = 0.5 * (p * (p.log() - m.log())).sum(dim=-1)
+        js = js + 0.5 * (q * (q.log() - m.log())).sum(dim=-1)
+        if self.reduction == "sum":
+            return js.sum()
+        if self.reduction == "none":
+            return js
+        return js.mean()
+
 def knn_monitor(net, device, memory_data_loader, test_data_loader, num_classes, k=200, t=0.1):
     """
     Perform k-Nearest Neighbors (kNN) monitoring.
@@ -124,6 +157,11 @@ def model_train(
     device,
     lradj
 ):
+    # Accept comma-separated loss specifications for CLI compatibility.  The
+    # first entry is the active objective; surrounding whitespace is ignored.
+    # (A single loss name remains unchanged.)
+    if isinstance(loss_name, str) and "," in loss_name:
+        loss_name = loss_name.split(",", 1)[0].strip()
     if loss_name in ["CrossEntropyLoss", "BCEWithLogitsLoss", "MultiLabelSoftMarginLoss"]:
         criterion = eval(f"torch.nn.{loss_name}")()
     elif loss_name == "TripletMarginLoss":
@@ -131,6 +169,8 @@ def model_train(
         miner = miners.TripletMarginMiner(margin=0.1, type_of_triplets="semihard")
     elif loss_name == "SupConLoss":
         criterion = losses.SupConLoss(temperature=0.1)
+    elif loss_name == "JSDivergence":
+        criterion = JSDivergence()
     elif loss_name == "MultiCrossEntropyLoss":
         criterion = torch.nn.CrossEntropyLoss()
     else:
@@ -161,6 +201,15 @@ def model_train(
                 loss = criterion(outs, cur_y, hard_pairs)
             elif loss_name == "SupConLoss":
                 loss = criterion(outs, cur_y)
+            elif loss_name == "JSDivergence":
+                # Models should return two logits (tuple/list), or outs may
+                # have shape (batch, 2, classes).
+                if isinstance(raw_outs, (tuple, list)) and len(raw_outs) == 2:
+                    loss = criterion(raw_outs[0], raw_outs[1])
+                elif outs.ndim >= 3 and outs.shape[1] == 2:
+                    loss = criterion(outs[:, 0], outs[:, 1])
+                else:
+                    raise ValueError("JSDivergence requires two model outputs.")
             elif loss_name == "MultiCrossEntropyLoss":
                 loss = 0
                 cur_indices = torch.nonzero(cur_y)

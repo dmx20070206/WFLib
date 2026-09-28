@@ -29,8 +29,8 @@ class AWF(nn.Module):
         # Define the classifier part of the network
         self.classifier = nn.Sequential(
             nn.Flatten(),  # Flatten the tensor to a vector
-            nn.Linear(in_features=32*45, out_features=num_classes)  # Fully connected layer for classification
         )
+        self.mlp = nn.Linear(in_features=32*45, out_features=num_classes)
 
     def forward(self, x):
         # Ensure the input tensor has the expected shape
@@ -40,6 +40,7 @@ class AWF(nn.Module):
         x = self.feature_extraction(x)
         
         # Pass the output through the classifier
-        x = self.classifier(x)
+        feat = self.classifier(x)
+        out = self.mlp(feat)
         
-        return x
+        return out, feat

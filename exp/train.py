@@ -34,7 +34,14 @@ parser.add_argument("--train_epochs", type=int, default=30, help="Train epochs")
 parser.add_argument("--batch_size", type=int, default=256, help="Batch size of train input data")
 parser.add_argument("--learning_rate", type=float, default=2e-3, help="Optimizer learning rate")
 parser.add_argument("--optimizer", type=str, default="Adam", help="Optimizer")
-parser.add_argument("--loss", type=str, default="CrossEntropyLoss", help="Loss function")
+parser.add_argument(
+    "--loss", nargs="+", default=["CrossEntropyLoss"],
+    help="One or more loss functions (comma-separated values are also accepted)",
+)
+parser.add_argument(
+    "--weights", nargs="+", type=float, default=None,
+    help="Weights corresponding to --loss; defaults to 1 for every loss",
+)
 parser.add_argument("--lradj", type=str, default="None", 
                     help="adjust learning rate, option=[None, StepLR]")
 
@@ -125,5 +132,6 @@ model_utils.model_train(
     num_classes,
     args.num_tabs,
     device,
-    args.lradj
+    args.lradj,
+    args.weights,
 )

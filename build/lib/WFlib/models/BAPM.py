@@ -90,8 +90,14 @@ class BAPM(nn.Module):
         x = torch.cat(multi_head_attn, dim=1)
 
         # Reshape and apply fully connected layer
-        x_reshaped = x.contiguous().view(-1, x.size(-1))
-        x_reshaped = self.fc(x_reshaped)
+        feat = x.contiguous().view(-1, x.size(-1))
+        x_reshaped = self.fc(feat)
         x = x_reshaped.contiguous().view(x.size(0), -1, x_reshaped.size(-1))
-        return x.mean(1)
-    
+        return x.mean(1), feat
+
+if __name__ == '__main__':
+    net = BAPM(num_classes=100)
+    x = np.random.rand(4, 1, 8500)
+    x = torch.tensor(x, dtype=torch.float32)
+    out, _ = net(x)
+    print(f"in:{x.shape} --> out:{out.shape}, {_.shape}")

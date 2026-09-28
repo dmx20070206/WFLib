@@ -1,0 +1,152 @@
+{
+  "inputs": {
+    "before": "/data/diaomingxuan/Traffic-Drift/datasets/TemporalDrift/day14.npz",
+    "after": "/data/diaomingxuan/Traffic-Drift/datasets/TemporalDrift/day270.npz",
+    "representation": "traffic",
+    "x_key": "X",
+    "y_key": "y",
+    "max_per_class": 500,
+    "seed": 42
+  },
+  "data": {
+    "before_total": 22603,
+    "after_total": 19935,
+    "before_used": 22603,
+    "after_used": 19935,
+    "common_class_count": 102,
+    "before_only_classes": [],
+    "after_only_classes": [],
+    "feature_count": 17
+  },
+  "global_drift": {
+    "domain_auc_mean": 0.6878318165842348,
+    "domain_auc_fold_std": 0.005456614704487121,
+    "class_prior_jsd_bits": 0.0013954629891571486,
+    "detectable_auc_ge_0_60": true
+  },
+  "decomposition": {
+    "shared_shift_norm": 0.392434266473122,
+    "local_residual_rms": 2.1338621718895117,
+    "total_class_shift_rms": 2.169647994980596,
+    "shared_fraction": 0.03271562980199294,
+    "local_fraction": 0.9672843701980071,
+    "direction_dispersion": 0.550607369734357,
+    "pairwise_cosine_mean": 0.1940522879800142,
+    "pairwise_opposite_fraction": 0.31993787614055524,
+    "magnitude_mean": 1.530129270954319,
+    "magnitude_median": 0.8566221572051234,
+    "magnitude_cv": 1.0052782787413186,
+    "magnitude_robust_cv": 1.721576160900257,
+    "magnitude_min": 0.28592808763400085,
+    "magnitude_max": 7.092011671450845
+  },
+  "bootstrap_95_ci": {
+    "shared_shift_norm": [
+      0.365033139545156,
+      0.42090825584024877
+    ],
+    "local_residual_rms": [
+      2.050387486807624,
+      2.281067792509833
+    ],
+    "shared_fraction": [
+      0.0282187242531067,
+      0.03751242706020769
+    ],
+    "local_fraction": [
+      0.9624875729397924,
+      0.9717812757468933
+    ],
+    "direction_dispersion": [
+      0.5557237540342359,
+      0.5826918148138093
+    ],
+    "pairwise_cosine_mean": [
+      0.16596935035974747,
+      0.18943471613609322
+    ],
+    "magnitude_cv": [
+      0.9563854507485499,
+      1.0456197931261473
+    ],
+    "magnitude_robust_cv": [
+      1.3759328602946073,
+      1.7828387828009855
+    ]
+  },
+  "assessment": {
+    "global_and_local_drift": true,
+    "local_component_substantial": true,
+    "class_directions_inconsistent": true,
+    "class_magnitudes_inconsistent": true,
+    "thresholds": {
+      "domain_auc": 0.6,
+      "local_fraction": 0.25,
+      "direction_dispersion": 0.25,
+      "magnitude_robust_cv": 0.3
+    },
+    "note": "结论采用描述性阈值，需结合 bootstrap CI、逐类结果和业务尺度解释。"
+  },
+  "top_feature_shifts": [
+    {
+      "feature": "log_iat_p50",
+      "shared_shift": -0.1624029774190875,
+      "class_shift_std": 1.093309707421964,
+      "absolute_shared_shift": 0.1624029774190875
+    },
+    {
+      "feature": "log_iat_p90",
+      "shared_shift": -0.1262372041035074,
+      "class_shift_std": 1.0379623619160272,
+      "absolute_shared_shift": 0.1262372041035074
+    },
+    {
+      "feature": "log_duration",
+      "shared_shift": -0.0907884465572222,
+      "class_shift_std": 0.9610457240099812,
+      "absolute_shared_shift": 0.0907884465572222
+    },
+    {
+      "feature": "log_max_burst_length",
+      "shared_shift": 0.20345631005433423,
+      "class_shift_std": 0.2744183309318815,
+      "absolute_shared_shift": 0.20345631005433423
+    },
+    {
+      "feature": "log_mean_burst_length",
+      "shared_shift": -0.11575778260769105,
+      "class_shift_std": 0.3471702656789461,
+      "absolute_shared_shift": 0.11575778260769105
+    },
+    {
+      "feature": "direction_switch_rate",
+      "shared_shift": 0.12389509814320898,
+      "class_shift_std": 0.3136918029341764,
+      "absolute_shared_shift": 0.12389509814320898
+    },
+    {
+      "feature": "log_burst_count",
+      "shared_shift": 0.10841092752113311,
+      "class_shift_std": 0.31791783422433156,
+      "absolute_shared_shift": 0.10841092752113311
+    },
+    {
+      "feature": "log_iat_mean",
+      "shared_shift": -0.049272382030229205,
+      "class_shift_std": 0.37493669158475623,
+      "absolute_shared_shift": 0.049272382030229205
+    },
+    {
+      "feature": "log_packet_count",
+      "shared_shift": 0.04060611287318545,
+      "class_shift_std": 0.36870965326591676,
+      "absolute_shared_shift": 0.04060611287318545
+    },
+    {
+      "feature": "log_negative_count",
+      "shared_shift": 0.028344384999224523,
+      "class_shift_std": 0.3752130575160618,
+      "absolute_shared_shift": 0.028344384999224523
+    }
+  ]
+}

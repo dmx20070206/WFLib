@@ -1,7 +1,7 @@
 dataset=TemporalDrift
 model=RF
 
-for filename in train valid test day14 day30 day90 day150 day270
+for filename in train valid day14 day30 day90 day150 day270
 do 
     python -u exp/dataset_process/gen_tam.py \
       --dataset ${dataset} \

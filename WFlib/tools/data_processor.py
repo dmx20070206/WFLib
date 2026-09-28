@@ -318,7 +318,7 @@ def extract_TAM(sequences, num_workers=30):
     Returns:
     ndarray: Extracted TAM features.
     """
-    maximum_load_time = 80  # Maximum load time for packets
+    maximum_load_time = 220  # Maximum load time for packets
     max_matrix_len = 1800  # Maximum length of the matrix
     num_sequences = sequences.shape[0]
     TAM = np.zeros((num_sequences, 2, max_matrix_len))

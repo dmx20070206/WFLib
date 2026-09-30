@@ -6,7 +6,7 @@ import numpy as np
 class DMX(nn.Module):
     def __init__(self, num_classes=100):
         """
-        Initialize the DMX model.
+        Initialize the RF model.
 
         Parameters:
         num_classes (int): Number of output classes.
@@ -43,41 +43,10 @@ class DMX(nn.Module):
         """
         x = self.first_layer(x)
         x = x.view(x.size(0), self.first_layer_out_channel, -1)
-
-        # ``self.features`` ends with a num_classes-channel convolutional
-        # block.  That block is part of the classifier, so it should not be
-        # used as the metric-learning/prototype representation: its channels
-        # are tied directly to the class count.  Keep the original Sequential
-        # object and split it at runtime so old checkpoints remain compatible.
-        embedding_map = x
-        for layer in self.features[:-3]:
-            embedding_map = layer(embedding_map)
-
-        logits_map = embedding_map
-        for layer in self.features[-3:]:
-            logits_map = layer(logits_map)
-
-        out = self.classifier(logits_map).flatten(1)
-        # A 512-D vector is substantially better conditioned for prototypes
-        # than flattening the class-logit feature map over all time positions.
-        embedding = torch.nn.functional.adaptive_avg_pool1d(
-            embedding_map, 1
-        ).flatten(1)
-        return out, embedding
-
-    def logits_from_embedding(self, embedding):
-        """Apply the original classifier path to a pooled penultimate feature.
-
-        The normal forward path has a temporal feature map before the final
-        class-dependent convolution.  The adapter receives its pooled
-        512-dimensional representation, so use a singleton temporal position
-        while reusing the exact original classifier layers and weights.
-        """
-        embedding = embedding.reshape(embedding.shape[0], 512, -1)
-        logits_map = embedding
-        for layer in self.features[-3:]:
-            logits_map = layer(logits_map)
-        return self.classifier(logits_map).flatten(1)
+        x = self.features(x)
+        out = self.classifier(x)
+        out = out.view(out.size(0), -1)
+        return out, x.view(x.size(0), -1)
 
     def _initialize_weights(self):
         """

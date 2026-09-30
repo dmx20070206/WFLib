@@ -48,11 +48,6 @@ class RF(nn.Module):
         out = out.view(out.size(0), -1)
         return out, x.view(x.size(0), -1)
 
-    def logits_from_embedding(self, embedding):
-        """Apply the original adaptive-pool classifier to a flattened feature."""
-        feature_map = embedding.reshape(embedding.shape[0], self.class_num, -1)
-        return self.classifier(feature_map).flatten(1)
-
     def _initialize_weights(self):
         """
         Initialize weights for the network layers.

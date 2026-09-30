@@ -365,7 +365,7 @@ def log_prototype_geometry(prototypes, source_labels, alpha=1.0, contrast_weight
 
 
 def log_trainable_parameters(target_encoder, translator):
-    _LOGGER.info("[Stage 3] Parameter trainability after unfreezing target encoder")
+    _LOGGER.info("[Stage 3] Parameter trainability for Stage 3")
     for name, module in (("target_encoder", target_encoder), ("translator", translator)):
         total = sum(p.numel() for p in module.parameters())
         trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)

@@ -27,3 +27,6 @@ WFlib/tools/rmnoise.py
 WFlib/tools/save.py
 WFlib/tools/split_valid.py
 WFlib/tools/trace_to_npz.py
+tests/test_proteus_adain.py
+tests/test_proteus_ccl.py
+tests/test_proteus_training.py

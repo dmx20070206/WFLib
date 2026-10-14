@@ -6,4 +6,8 @@ plots/
 results/
 *.pyc
 __pycache__/
-experiments/
+experiments/*
+!experiments/insight_a1/
+!experiments/insight_a2/
+
+!experiments/insight_a25/

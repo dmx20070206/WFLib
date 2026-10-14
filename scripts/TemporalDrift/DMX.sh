@@ -46,7 +46,6 @@ do
         --ot_max_descriptors 0 \
         --map_reg_weight 0.01 \
         --adapt_lr 1e-4 \
-        --load_stage2 \
         --augmented_loss_weight 0.8 \
         --reliability_strength 1.0
 done

@@ -2,17 +2,20 @@
 
 Console output contains epoch loss/accuracy only. Detailed training metrics,
 configuration and optional target geometry go to a single readable log file.
-Stage 2 uses Euclidean distances; target geometry uses cosine distances.
+Stage 2 trains a class-conditional affine translator with local OT. Legacy
+prototype diagnostic helpers remain available for older experiments.
 """
 
 from __future__ import annotations
 
 import logging
 import math
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Mapping
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -143,14 +146,17 @@ def configure_logging(path, config, device):
     _LOGGER.info("  %-28s : %s", "effective_device", device)
     _LOGGER.info(
         "\nMetric guide:\n"
-        "  Stage 1/3 acc: held-out target evaluation, original classification head.\n"
-        "  Stage 2 acc: translated source training samples, nearest prototype.\n"
-        "  Stage 2 distances: Euclidean; align: squared positive distance.\n"
-        "  margin: nearest negative minus positive distance; active: fraction of\n"
-        "  negative pairs below alpha (excludes true class).\n"
-        "  grad_norm: sample-weighted mean batch gradient L2 norm before update.\n"
-        "  Epoch metrics: sample-weighted online means; N/A means unavailable.\n"
-        "  Target prototype diagnostics use cosine distance, not Euclidean.\n"
+        "  Stage 1: frozen target support bank; no optimization.\n"
+        "  Stage 2 loss: ot + map_reg_weight * regularization.\n"
+        "  ot: class-averaged local cosine/time OT with entropy regularization.\n"
+        "  regularization: mean squared affine scale delta and bias.\n"
+        "  Stage 2 epoch metrics: equally weighted batch means; no accuracy.\n"
+        "  Stage 3 loss: target + augmented_loss_weight * source_weighted.\n"
+        "  target: support CE; source_weighted: reliability-weighted source CE.\n"
+        "  Stage 3 epoch metrics: weighted by the number of source samples\n"
+        "  (target samples for the target-only ablation).\n"
+        "  acc: held-out target evaluation, never used for optimization.\n"
+        "  N/A means unavailable.\n"
     )
 
 
@@ -169,6 +175,127 @@ def log_epoch(stage, epoch, epochs, values, accuracy=None, acc_scope=""):
         if name != "loss":
             _LOGGER.info("  %-24s : %s", name, _format(value))
     _LOGGER.info("")
+
+
+class EpochMetrics:
+    """Accumulate scalar batch metrics, detached from the training graph.
+
+    The default weight gives an equal-batch average (Stage 2). Passing a
+    batch size gives a sample-weighted average (Stage 3). Each metric keeps
+    its own denominator so optional metrics can be omitted in some batches.
+    """
+
+    def __init__(self):
+        self.sums = {}
+        self.weights = {}
+        self.count = 0.0
+        self.batches = 0
+
+    def update(self, weight=1, **values):
+        weight = float(weight)
+        if not math.isfinite(weight) or weight < 0:
+            raise ValueError("Metric weight must be finite and non-negative")
+        if weight == 0:
+            return
+        scalars = {
+            name: float(value.detach().item()) if isinstance(value, torch.Tensor)
+            else float(value)
+            for name, value in values.items()
+        }
+        for name, value in scalars.items():
+            self.sums[name] = self.sums.get(name, 0.0) + weight * value
+            self.weights[name] = self.weights.get(name, 0.0) + weight
+        self.count += weight
+        self.batches += 1
+
+    def log(self, stage, epoch, epochs, accuracy=None, acc_scope=""):
+        values = {name: total / self.weights[name] for name, total in self.sums.items()}
+        values.setdefault("loss", None)
+        values.update(batches=self.batches, total_weight=self.count)
+        log_epoch(stage, epoch, epochs, values, accuracy, acc_scope)
+        return values
+
+
+def _target_bank_summary(bank):
+    """Summarize support metadata without serializing the large feature bank."""
+    labels = bank.support_labels.detach().cpu().long().reshape(-1)
+    counts = torch.bincount(labels, minlength=len(bank.descriptors))
+    return {
+        "num_classes": len(bank.descriptors),
+        "support_samples": len(labels),
+        "support_map_shape": list(bank.support_maps.shape),
+        "per_class": {
+            str(class_id): {
+                "support_count": int(counts[class_id]),
+                "descriptor_count": len(descriptors),
+                "variance": float(bank.variances[class_id].detach().cpu()),
+                "weight": float(bank.weights[class_id].detach().cpu()),
+            }
+            for class_id, descriptors in enumerate(bank.descriptors)
+        },
+    }
+
+
+def log_target_bank(bank):
+    """Log the frozen support bank and per-class reliability statistics."""
+    summary = _target_bank_summary(bank)
+    _LOGGER.info("%s\n[Stage 1] Target support bank\n%s", "-" * 80, "-" * 80)
+    for name, value in summary.items():
+        if name != "per_class":
+            _LOGGER.info("  %-24s : %s", name, value)
+    _LOGGER.info("  Variance and reliability weights use target support only.")
+    _LOGGER.info("\n  %-8s %12s %12s %16s %16s",
+                 "Class", "Support", "Descriptors", "Variance", "Weight")
+    for label, row in summary["per_class"].items():
+        _LOGGER.info("  %-8s %12d %12d %16s %16s", label,
+                     row["support_count"], row["descriptor_count"],
+                     _format(row["variance"]), _format(row["weight"]))
+    _LOGGER.info("")
+    return summary
+
+
+def log_stage2_checkpoint(path, loaded=False):
+    """Record whether Stage 2 trained a translator or reused a checkpoint."""
+    _LOGGER.info("[Stage 2] Translator checkpoint %s: %s",
+                 "loaded (training skipped)" if loaded else "saved", path)
+    _LOGGER.info("")
+
+
+def _json_value(value):
+    """Convert experiment values to portable JSON, using null for NaN/Inf."""
+    if isinstance(value, torch.Tensor):
+        return _json_value(value.detach().cpu().tolist())
+    if isinstance(value, (np.ndarray, np.generic)):
+        return _json_value(value.tolist())
+    if isinstance(value, Mapping):
+        return {str(key): _json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_value(item) for item in value]
+    if isinstance(value, (Path, torch.device)):
+        return str(value)
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
+def save_run_report(args, result, baseline, bank, support_indices, stage2_path):
+    """Save reproducible run metadata beside the readable training log."""
+    path = Path(args.log_path) / args.dataset / args.model / f"{args.result_file}.json"
+    report = _json_value({
+        "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "config": vars(args),
+        "baseline": baseline,
+        "result": result,
+        "target_bank": _target_bank_summary(bank),
+        "support_indices": support_indices,
+        "stage2_checkpoint": stage2_path,
+    })
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as file:
+        json.dump(report, file, ensure_ascii=False, indent=2, allow_nan=False)
+        file.write("\n")
+    _LOGGER.info("Run report saved: %s", path)
+    return path
 
 
 class Stage2Metrics:
